@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # Redis для кеширования
+  redis:
+    image: redis:7-alpine
+    container_name: sync-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - sync-network
+
+  # Основное приложение синхронизации
+  sync-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zabbix-netbox-sync
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+    volumes:
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    depends_on:
+      - redis
+    networks:
+      - sync-network
+    # Для периодического запуска
+    command: sh -c "while true; do python main.py; sleep 3600; done"
+
+  # Опционально: Redis Commander для мониторинга
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: redis-commander
+    restart: unless-stopped
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - sync-network
+
+networks:
+  sync-network:
+    driver: bridge
+
+volumes:
+  redis-data:

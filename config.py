@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+Конфигурация для синхронизации Zabbix → NetBox
+"""
+import os
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения
+load_dotenv()
+
+# === ОСНОВНЫЕ НАСТРОЙКИ ===
+DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+VERIFY_SSL = os.getenv('VERIFY_SSL', 'false').lower() == 'true'
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', '50'))
+HOST_LIMIT = int(os.getenv('HOST_LIMIT')) if os.getenv('HOST_LIMIT') else None
+TIMEOUT = int(os.getenv('TIMEOUT', '10'))
+
+# === ZABBIX ===
+ZABBIX_URL = os.getenv('ZABBIX_URL', 'http://zabbix.local')
+ZABBIX_USER = os.getenv('ZABBIX_USER')
+ZABBIX_PASSWORD = os.getenv('ZABBIX_PASSWORD')
+
+# === NETBOX ===
+NETBOX_URL = os.getenv('NETBOX_URL', 'http://netbox.local')
+NETBOX_TOKEN = os.getenv('NETBOX_TOKEN')
+
+# === REDIS ===
+REDIS_ENABLED = os.getenv('REDIS_ENABLED', 'true').lower() == 'true'
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
+REDIS_DB = int(os.getenv('REDIS_DB', '0'))
+REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', '')
+REDIS_KEY_PREFIX = os.getenv('REDIS_KEY_PREFIX', 'zabbix_host:')
+REDIS_TTL = int(os.getenv('REDIS_TTL', '86400'))  # 24 часа
+
+# === TELEGRAM ===
+TELEGRAM_ENABLED = os.getenv('TELEGRAM_ENABLED', 'true').lower() == 'true'
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TELEGRAM_PARSE_MODE = os.getenv('TELEGRAM_PARSE_MODE', 'HTML')  # HTML или Markdown
+TELEGRAM_DISABLE_NOTIFICATION = os.getenv('TELEGRAM_DISABLE_NOTIFICATION', 'false').lower() == 'true'
+
+# === ЛОГИРОВАНИЕ ===
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+LOG_DIR = os.getenv('LOG_DIR', 'logs')
+
+# === МАППИНГИ ===
+
+# IP подсети → Site
+SITE_MAPPING = {
+    '10.11': 'DC Kabanbay-Batyr28',
+    '10.127': 'DC Almaty',
+    '10.13': 'DC Karaganda',
+    '10.14': 'DC Atyrau',
+    '10.10': 'DC Konaeva10'
+}
+
+# Site → Location
+LOCATION_MAPPING = {
+    'DC Kabanbay-Batyr28': 'city Astana street Kabanbay batyr 28',
+    'DC Almaty': 'city Almaty street Karasay Batyr 55',
+    'DC Karaganda': 'city Karaganda street 132-й учетный квартал участок 168',
+    'DC Atyrau': 'city Atyrau street XXX',
+    'DC Konaeva10': 'city Astana street Konaeva 10'
+}
+
+# Vendor + Model → U-Height
+U_HEIGHT_MAPPING = {
+    'Dell Inc. PowerEdge R640': 1,
+    'Dell Inc. PowerEdge R740': 2,
+    'HPE ProLiant DL360 Gen10': 1,
+    'HPE ProLiant DL380 Gen10': 2,
+    'Huawei CH121 V3': 1,
+    'Huawei RH1288 V3': 1,
+    'Huawei RH2288H V3': 2,
+    'Huawei RH5885H V3': 4,
+    'Huawei Technologies Co., Ltd. RH5885H V3': 4,
+    'Huawei Technologies Co., Ltd. To be filled by O.E.M.': 4,
+    'Lenovo J900XBXR': 1,
+    'Lenovo ThinkAgile VX7531 Node': 2,
+    'Lenovo ThinkSystem SR645': 1,
+    'Lenovo ThinkSystem SR650': 2,
+    'VMware Virtual Platform': 0,  # Виртуальная машина
+}
+
+# Default Site если не определен по IP
+DEFAULT_SITE = 'DC Konaeva10'
+
+# === CUSTOM FIELDS в NetBox ===
+CUSTOM_FIELDS = [
+    'cpu_model',
+    'memory_size',
+    'os_name',
+    'os_version',
+    'vsphere_cluster',
+    'rack_location',
+    'zabbix_hostid',
+    'last_sync'
+]
+
+# === ФИЛЬТРЫ ДЛЯ ZABBIX ===
+# Шаблоны для исключения
+EXCLUDED_TEMPLATES = [
+    'Juniper by SNMP',
+    'Template Net SNMP',
+    'Template Module Generic SNMP'
+]
+
+# Группы для исключения
+EXCLUDED_GROUPS = [
+    'Network',
+    'DataStore',
+    'Virtual machines'
+]
+
+# Шаблоны для включения (только эти)
+INCLUDED_TEMPLATES = [
+    'VMware Hypervisor'
+]
+
+# === ВАЛИДАЦИЯ ===
+def validate_config():
+    """Проверка обязательных параметров конфигурации"""
+    errors = []
+    
+    if not ZABBIX_USER:
+        errors.append("ZABBIX_USER не установлен")
+    if not ZABBIX_PASSWORD:
+        errors.append("ZABBIX_PASSWORD не установлен")
+    if not NETBOX_TOKEN:
+        errors.append("NETBOX_TOKEN не установлен")
+    
+    if TELEGRAM_ENABLED and not TELEGRAM_BOT_TOKEN:
+        errors.append("TELEGRAM_BOT_TOKEN не установлен, но TELEGRAM_ENABLED=true")
+    
+    if TELEGRAM_ENABLED and not TELEGRAM_CHAT_ID:
+        errors.append("TELEGRAM_CHAT_ID не установлен, но TELEGRAM_ENABLED=true")
+    
+    if REDIS_ENABLED and REDIS_PASSWORD and not REDIS_PASSWORD:
+        errors.append("REDIS_PASSWORD может потребоваться")
+    
+    return errors
