@@ -356,7 +356,7 @@ class ServerSync:
                     return None, None
             
             # Работаем с IP (без маски, как вы просили)
-            ip_address = self.netbox.ipam.ip_addresses.get(address=ip)
+            ip_address = self.netbox.ipam.ip_addresses.get(address=f"{ip}/32")
             
             if ip_address:
                 if not ip_address.assigned_object or ip_address.assigned_object_id != interface.id:

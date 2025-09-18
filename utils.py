@@ -6,7 +6,7 @@ import re
 import hashlib
 import json
 import logging
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Tuple
 from datetime import datetime
 import config
 
@@ -16,7 +16,7 @@ class DataValidator:
     """Валидация данных из Zabbix"""
     
     @staticmethod
-    def validate_host_data(host_data: Dict) -> tuple[bool, str]:
+    def validate_host_data(host_data: Dict) -> Tuple[bool, str]:
         """
         Проверка минимальных требований для синхронизации
         Returns: (valid: bool, error_message: str)
