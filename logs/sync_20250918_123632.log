@@ -1,0 +1,9 @@
+2025-09-18 12:36:32,471 - root - INFO - ============================================================
+2025-09-18 12:36:32,471 - root - INFO - ЗАПУСК СИНХРОНИЗАЦИИ ZABBIX → NETBOX
+2025-09-18 12:36:32,472 - root - INFO - Лог файл: logs/sync_20250918_123632.log
+2025-09-18 12:36:32,472 - root - INFO - 🔸 MODE: DRY RUN (тестовый режим)
+2025-09-18 12:36:32,472 - root - INFO - 🔸 LIMIT: 1 хостов
+2025-09-18 12:36:32,472 - root - INFO - ============================================================
+2025-09-18 12:36:32,834 - sync - ERROR - ✗ Ошибка подключения к Zabbix: HTTPConnectionPool(host='zabbix-cloud.ttc.kz', port=80): Max retries exceeded with url: /api_jsonrpc.php (Caused by NameResolutionError("<urllib3.connection.HTTPConnection object at 0x742c412e43d0>: Failed to resolve 'zabbix-cloud.ttc.kz' ([Errno -2] Name or service not known)"))
+2025-09-18 12:36:32,834 - root - ERROR - Не удалось подключиться к необходимым сервисам
+2025-09-18 12:36:33,130 - root - INFO - Завершение работы

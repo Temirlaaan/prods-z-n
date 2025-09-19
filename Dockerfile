@@ -20,8 +20,8 @@ COPY main.py .
 COPY sync.py .
 COPY utils.py .
 
-# Создание директории для логов
-RUN mkdir -p /app/logs
+# Создание директории для логов с правильными правами
+RUN mkdir -p /app/logs && chmod 755 /app/logs
 
 # Пользователь для безопасности
 RUN useradd -m -u 1000 syncuser && \
@@ -30,4 +30,4 @@ RUN useradd -m -u 1000 syncuser && \
 USER syncuser
 
 # Команда по умолчанию
-CMD ["python", "main.py"]
+CMD ["python", "main.py"] 
