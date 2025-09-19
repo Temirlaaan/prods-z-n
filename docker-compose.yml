@@ -28,6 +28,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./.env:/app/.env
+      - .:/app  
     depends_on:
       - redis
     networks:

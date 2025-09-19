@@ -471,7 +471,7 @@ class ServerSync:
                 return False
             
             # Платформа
-            platform = self.ensure_platform()
+            platform = None
             
             # Роль устройства
             device_role = self.netbox.dcim.device_roles.get(name='Server')
