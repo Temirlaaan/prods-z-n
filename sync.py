@@ -381,34 +381,41 @@ class ServerSync:
             logger.error(f"  Ошибка работы с типом устройства {model}: {e}")
             return None
     
-    def ensure_rack(self, rack_name: str, site: Any) -> Optional[Any]:
+    def ensure_rack(self, rack_name: str, site: Any, location: Any = None) -> Optional[Any]:
         """Создание или получение стойки"""
         if not rack_name or not site:
             return None
         
         try:
-            # Ищем стойку
+            # Ищем стойку только по site (не по location!)
             rack = self.netbox.dcim.racks.get(
                 name=rack_name,
                 site_id=site.id
             )
             
             if not rack:
+                rack_data = {
+                    'name': rack_name,
+                    'site': site.id,
+                    'status': 'active',
+                    'u_height': 42,  # Стандартная высота
+                    'type': '4-post-cabinet',
+                    'width': 19,  # 19 inch
+                    'comments': 'Auto-created from Zabbix'
+                }
+                
+                # Location добавляем только если она существует
+                # НО: в NetBox location не обязательна для rack
+                if location:
+                    rack_data['location'] = location.id
+                
                 if not config.DRY_RUN:
-                    rack = self.netbox.dcim.racks.create(
-                        name=rack_name,
-                        site=site.id,
-                        status='active',
-                        u_height=42,  # Стандартная высота
-                        type='4-post-cabinet',
-                        width=19,  # 19 inch
-                        comments='Auto-created from Zabbix'
-                    )
-                    logger.info(f"  Создана стойка: {rack_name}")
+                    rack = self.netbox.dcim.racks.create(**rack_data)
+                    logger.info(f"  Создана стойка: {rack_name} в site {site.name}")
                 else:
                     logger.info(f"  [DRY RUN] Будет создана стойка: {rack_name}")
                     return None
-            
+        
             return rack
         except Exception as e:
             logger.error(f"  Ошибка работы со стойкой {rack_name}: {e}")
@@ -475,7 +482,7 @@ class ServerSync:
             rack_unit = inventory.get('location_lon', '')  # Используем location_lon для позиции U
             
             if rack_name:
-                rack = self.ensure_rack(rack_name, site)
+                rack = self.ensure_rack(rack_name, site, location)
                 if rack and rack_unit:
                     try:
                         rack_position = int(rack_unit)
@@ -527,14 +534,17 @@ class ServerSync:
                 'site': site.id,
                 'status': 'active' if host_data.get('status') == '0' else 'offline',
                 'platform': platform.id if platform else None,
-                'location': location.id if location else None,
-                'rack': rack.id if rack else None,
-                'position': rack_position if rack_position else None,
-                'face': 'front' if rack else None,
-                'serial': inventory.get('serialno_a', ''),  # Серийный номер в основном поле
-                'asset_tag': inventory.get('asset_tag', ''),  # Инвентарный номер в основном поле
+                'location': location.id if location else None,  # Location для device
+                'serial': inventory.get('serialno_a', ''),
+                'asset_tag': inventory.get('asset_tag', ''),
                 'custom_fields': custom_fields
             }
+
+            if rack:
+                device_data['rack'] = rack.id
+                if rack_position:
+                    device_data['position'] = rack_position
+                    device_data['face'] = 'front'
             
             # Убираем None и пустые значения
             device_data = {k: v for k, v in device_data.items() if v not in [None, '']}
