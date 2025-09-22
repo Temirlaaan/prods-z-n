@@ -222,8 +222,10 @@ class ServerSync:
         
         return new_hosts, changed_hosts
     
+   # В файле sync.py найдите и замените метод check_decommissioned_devices:
+
     def check_decommissioned_devices(self):
-        """Проверка и пометка неактивных устройств как decommissioned"""
+        """Проверка и пометка неактивных устройств как decommissioning"""
         if not self.redis_client:
             return
         
@@ -253,11 +255,11 @@ class ServerSync:
                         
                         if days_inactive > config.DECOMMISSION_AFTER_DAYS:
                             if not config.DRY_RUN:
-                                device.status = 'decommissioned'
+                                device.status = 'decommissioning'  # НЕ decommissioned!
                                 device.save()
-                                logger.info(f"Устройство {device.name} помечено как decommissioned (неактивно {days_inactive} дней)")
+                                logger.info(f"Устройство {device.name} помечено как decommissioning (неактивно {days_inactive} дней)")
                             else:
-                                logger.info(f"[DRY RUN] Устройство {device.name} будет помечено как decommissioned")
+                                logger.info(f"[DRY RUN] Устройство {device.name} будет помечено как decommissioning")
                             
                             self.stats['decommissioned_hosts'].append(device.name)
                     else:
@@ -270,7 +272,7 @@ class ServerSync:
                 self.redis_client.set(last_seen_key, datetime.now().isoformat())
                 
         except Exception as e:
-            logger.error(f"Ошибка при проверке decommissioned устройств: {e}")
+            logger.error(f"Ошибка при проверке decommissioning устройств: {e}")
     
     def ensure_manufacturer(self, vendor_name: str) -> Optional[Any]:
         """Создание или получение производителя"""
