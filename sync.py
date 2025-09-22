@@ -4,16 +4,17 @@
 """
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from pyzabbix import ZabbixAPI
 import pynetbox
 import redis
 import requests
+import json
 import config
 from utils import (
     DataValidator, DataNormalizer, HashCalculator,
-    IPHelper, UHeightHelper, NotificationHelper
+    IPHelper, UHeightHelper, NotificationHelper, ChangeTracker
 )
 
 logger = logging.getLogger(__name__)
@@ -26,13 +27,17 @@ class ServerSync:
         self.zabbix = None
         self.netbox = None
         self.redis_client = None
-        self.telegram_bot = None  # Изменено
+        self.telegram_bot = None
+        self.change_tracker = ChangeTracker()  # Для отслеживания детальных изменений
         self.stats = {
             'new_hosts': [],
             'changed_hosts': [],
             'error_hosts': [],
+            'decommissioned_hosts': [],
             'new_models': [],
-            'skipped_hosts': []
+            'skipped_hosts': [],
+            'detailed_changes': {},  # Детальные изменения по хостам
+            'error_details': {}      # Детали ошибок
         }
     
     def connect_services(self) -> bool:
@@ -67,7 +72,8 @@ class ServerSync:
                     host=config.REDIS_HOST,
                     port=config.REDIS_PORT,
                     db=config.REDIS_DB,
-                    password=config.REDIS_PASSWORD if config.REDIS_PASSWORD else None
+                    password=config.REDIS_PASSWORD if config.REDIS_PASSWORD else None,
+                    decode_responses=True  # Для удобства работы со строками
                 )
                 self.redis_client.ping()
                 logger.info("✓ Redis подключен")
@@ -78,7 +84,6 @@ class ServerSync:
         # Telegram (опционально)
         if config.TELEGRAM_ENABLED and config.TELEGRAM_BOT_TOKEN:
             try:
-                # Тестовое сообщение для проверки
                 self.telegram_bot = TelegramBot(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
                 test_response = self.telegram_bot.test_connection()
                 if test_response:
@@ -120,14 +125,11 @@ class ServerSync:
     def get_vmware_hosts(self) -> List[Dict]:
         """Получение списка VMware хостов из Zabbix"""
         try:
-            # Получаем все хосты
+            # Получаем все хосты с расширенным inventory
             hosts = self.zabbix.host.get(
                 output=['hostid', 'host', 'name', 'status'],
                 selectParentTemplates=['templateid', 'name'],
-                selectInventory=[
-                    'vendor', 'model', 'os', 'os_short',
-                    'hardware', 'alias', 'software_app_a', 'location'
-                ],
+                selectInventory='extend',  # Получаем ВСЕ поля inventory
                 selectInterfaces=['ip', 'type', 'main'],
                 selectGroups=['groupid', 'name']
             )
@@ -174,7 +176,7 @@ class ServerSync:
             return []
     
     def check_changes(self, hosts: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-        """Проверка изменений через Redis"""
+        """Проверка изменений через Redis с детальным отслеживанием"""
         if not self.redis_client:
             # Без Redis все хосты считаются новыми
             return hosts, []
@@ -184,35 +186,99 @@ class ServerSync:
         
         for host in hosts:
             host_id = host['hostid']
+            host_name = host.get('name', 'Unknown')
             primary_ip = IPHelper.get_primary_ip(host)
             current_hash = HashCalculator.calculate_host_hash(host, primary_ip)
             
             redis_key = f"{config.REDIS_KEY_PREFIX}{host_id}"
+            redis_data_key = f"{config.REDIS_KEY_PREFIX}data:{host_id}"
             
             try:
                 old_hash = self.redis_client.get(redis_key)
+                old_data = self.redis_client.get(redis_data_key)
                 
                 if old_hash is None:
                     new_hosts.append(host)
-                elif old_hash.decode('utf-8') != current_hash:
+                elif old_hash != current_hash:
                     changed_hosts.append(host)
+                    
+                    # Отслеживаем что именно изменилось
+                    if old_data:
+                        try:
+                            old_host_data = json.loads(old_data)
+                            changes = self.change_tracker.compare_hosts(old_host_data, host)
+                            if changes:
+                                self.stats['detailed_changes'][host_name] = changes
+                        except json.JSONDecodeError:
+                            logger.warning(f"Не удалось декодировать старые данные для {host_name}")
                 
-                # Обновляем хэш с TTL
+                # Обновляем хэш и данные с TTL
                 self.redis_client.setex(redis_key, config.REDIS_TTL, current_hash)
+                self.redis_client.setex(redis_data_key, config.REDIS_TTL, json.dumps(host))
                 
             except Exception as e:
                 logger.warning(f"Ошибка работы с Redis для хоста {host_id}: {e}")
-                # При ошибке считаем хост измененным
                 changed_hosts.append(host)
         
         return new_hosts, changed_hosts
+    
+    def check_decommissioned_devices(self):
+        """Проверка и пометка неактивных устройств как decommissioned"""
+        if not self.redis_client:
+            return
+        
+        try:
+            # Получаем все устройства из NetBox с custom field zabbix_hostid
+            netbox_devices = self.netbox.dcim.devices.filter(
+                cf_zabbix_hostid__n=False,  # Не null
+                status='active'
+            )
+            
+            # Получаем все активные хосты из Zabbix
+            active_host_ids = set()
+            for host in self.get_vmware_hosts():
+                active_host_ids.add(host['hostid'])
+            
+            # Проверяем каждое устройство
+            for device in netbox_devices:
+                zabbix_hostid = device.custom_fields.get('zabbix_hostid')
+                if zabbix_hostid and zabbix_hostid not in active_host_ids:
+                    # Проверяем когда последний раз видели
+                    last_seen_key = f"{config.REDIS_KEY_PREFIX}lastseen:{zabbix_hostid}"
+                    last_seen = self.redis_client.get(last_seen_key)
+                    
+                    if last_seen:
+                        last_seen_date = datetime.fromisoformat(last_seen)
+                        days_inactive = (datetime.now() - last_seen_date).days
+                        
+                        if days_inactive > config.DECOMMISSION_AFTER_DAYS:
+                            if not config.DRY_RUN:
+                                device.status = 'decommissioned'
+                                device.save()
+                                logger.info(f"Устройство {device.name} помечено как decommissioned (неактивно {days_inactive} дней)")
+                            else:
+                                logger.info(f"[DRY RUN] Устройство {device.name} будет помечено как decommissioned")
+                            
+                            self.stats['decommissioned_hosts'].append(device.name)
+                    else:
+                        # Первый раз не видим - записываем дату
+                        self.redis_client.set(last_seen_key, datetime.now().isoformat())
+            
+            # Обновляем last_seen для активных хостов
+            for host_id in active_host_ids:
+                last_seen_key = f"{config.REDIS_KEY_PREFIX}lastseen:{host_id}"
+                self.redis_client.set(last_seen_key, datetime.now().isoformat())
+                
+        except Exception as e:
+            logger.error(f"Ошибка при проверке decommissioned устройств: {e}")
     
     def ensure_manufacturer(self, vendor_name: str) -> Optional[Any]:
         """Создание или получение производителя"""
         vendor_name = DataNormalizer.normalize_vendor(vendor_name)
         
         if not vendor_name or vendor_name == 'Unknown':
-            return None
+            # Для Unknown создаем Generic производителя
+            vendor_name = 'Generic'
         
         try:
             manufacturer = self.netbox.dcim.manufacturers.get(name=vendor_name)
@@ -228,19 +294,49 @@ class ServerSync:
                     logger.info(f"  Создан производитель: {vendor_name}")
                 else:
                     logger.info(f"  [DRY RUN] Будет создан производитель: {vendor_name}")
-                    return None
+                    # В dry-run режиме возвращаем фиктивный объект
+                    class FakeManufacturer:
+                        def __init__(self):
+                            self.name = vendor_name
+                            self.id = 999
+                    return FakeManufacturer()
             
             return manufacturer
         except Exception as e:
             logger.error(f"  Ошибка работы с производителем {vendor_name}: {e}")
             return None
     
-    def ensure_device_type(self, model: str, manufacturer: Any) -> Optional[Any]:
-        """Создание или получение типа устройства"""
+    def ensure_device_type(self, model: str, manufacturer: Any, host_data: Dict = None) -> Optional[Any]:
+        """Создание или получение типа устройства с улучшенной обработкой Unknown"""
+        original_model = model
         model = DataNormalizer.normalize_model(model)
         
-        if not model or model == 'Unknown' or not manufacturer:
+        if not manufacturer:
             return None
+        
+        # Обработка Unknown/To be filled моделей
+        if model == 'Unknown' or 'to be filled' in model.lower():
+            # Пытаемся определить модель из других полей
+            if host_data:
+                inventory = host_data.get('inventory', {})
+                hardware = inventory.get('hardware', '')
+                
+                # Пытаемся извлечь модель из hardware
+                if 'PowerEdge' in hardware:
+                    match = re.search(r'PowerEdge\s+(\w+)', hardware)
+                    if match:
+                        model = f"PowerEdge {match.group(1)}"
+                        logger.info(f"  Определена модель из hardware: {model}")
+                elif 'ProLiant' in hardware:
+                    match = re.search(r'ProLiant\s+(\w+)', hardware)
+                    if match:
+                        model = f"ProLiant {match.group(1)}"
+                        logger.info(f"  Определена модель из hardware: {model}")
+            
+            # Если все еще Unknown, используем Generic модель
+            if model == 'Unknown':
+                model = 'Generic Server'
+                logger.info(f"  Используется Generic модель для '{original_model}'")
         
         try:
             device_type = self.netbox.dcim.device_types.get(
@@ -254,25 +350,258 @@ class ServerSync:
                 # Определяем U-height
                 u_height = UHeightHelper.get_u_height(manufacturer.name, model)
                 if u_height is None:
-                    self.stats['new_models'].append(f"{manufacturer.name} {model}")
-                    u_height = 0  # NetBox требует значение
+                    # Для Generic/Unknown используем стандартный 2U
+                    if 'Generic' in model or 'Unknown' in model:
+                        u_height = 2
+                        logger.info(f"  Используется стандартный 2U для {model}")
+                    else:
+                        self.stats['new_models'].append(f"{manufacturer.name} {model}")
+                        u_height = 2  # По умолчанию
                 
                 if not config.DRY_RUN:
                     device_type = self.netbox.dcim.device_types.create(
                         manufacturer=manufacturer.id,
                         model=model,
                         slug=slug,
-                        u_height=u_height
+                        u_height=u_height,
+                        comments=f"Auto-created. Original model: {original_model}"
                     )
                     logger.info(f"  Создан тип устройства: {model} ({u_height}U)")
                 else:
                     logger.info(f"  [DRY RUN] Будет создан тип: {model} ({u_height}U)")
-                    return None
+                    # В dry-run режиме возвращаем фиктивный объект
+                    class FakeDeviceType:
+                        def __init__(self):
+                            self.model = model
+                            self.id = 999
+                    return FakeDeviceType()
             
             return device_type
         except Exception as e:
             logger.error(f"  Ошибка работы с типом устройства {model}: {e}")
             return None
+    
+    def ensure_rack(self, rack_name: str, site: Any) -> Optional[Any]:
+        """Создание или получение стойки"""
+        if not rack_name or not site:
+            return None
+        
+        try:
+            # Ищем стойку
+            rack = self.netbox.dcim.racks.get(
+                name=rack_name,
+                site_id=site.id
+            )
+            
+            if not rack:
+                if not config.DRY_RUN:
+                    rack = self.netbox.dcim.racks.create(
+                        name=rack_name,
+                        site=site.id,
+                        status='active',
+                        u_height=42,  # Стандартная высота
+                        type='4-post-cabinet',
+                        width=19,  # 19 inch
+                        comments='Auto-created from Zabbix'
+                    )
+                    logger.info(f"  Создана стойка: {rack_name}")
+                else:
+                    logger.info(f"  [DRY RUN] Будет создана стойка: {rack_name}")
+                    return None
+            
+            return rack
+        except Exception as e:
+            logger.error(f"  Ошибка работы со стойкой {rack_name}: {e}")
+            return None
+    
+    def sync_device(self, host_data: Dict) -> bool:
+        """Синхронизация одного устройства в NetBox с расширенной поддержкой"""
+        host_id = host_data['hostid']
+        host_name = host_data.get('name', 'Unknown')
+        
+        # Валидация
+        is_valid, error = DataValidator.validate_host_data(host_data)
+        if not is_valid:
+            logger.warning(f"Хост {host_name} пропущен: {error}")
+            self.stats['skipped_hosts'].append(host_name)
+            return False
+        
+        logger.info(f"\nОбработка: {host_name} (ID: {host_id})")
+        
+        device = None
+        interface = None
+        ip_address = None
+        
+        try:
+            inventory = host_data.get('inventory', {})
+            
+            # Для отладки - смотрим что есть в inventory
+            if config.LOG_LEVEL == 'DEBUG':
+                logger.debug(f"  Inventory для {host_name}: {json.dumps(inventory, indent=2)}")
+            
+            # IP и Site
+            primary_ip = IPHelper.get_primary_ip(host_data)
+            site_name = IPHelper.get_site_from_ip(primary_ip)
+            
+            site = self.netbox.dcim.sites.get(name=site_name)
+            if not site:
+                logger.error(f"  Site {site_name} не найден в NetBox")
+                self.stats['error_hosts'].append(host_name)
+                self.stats['error_details'][host_name] = f"Site {site_name} не найден"
+                return False
+            
+            # Локация
+            location_name = config.LOCATION_MAPPING.get(site_name)
+            location = self.ensure_location(location_name, site) if location_name else None
+            
+            # Производитель и модель
+            manufacturer = self.ensure_manufacturer(inventory.get('vendor'))
+            device_type = self.ensure_device_type(
+                inventory.get('model'), 
+                manufacturer, 
+                host_data  # Передаем host_data для лучшего определения модели
+            )
+            
+            if not device_type:
+                logger.error(f"  Не удалось определить тип устройства")
+                self.stats['error_hosts'].append(host_name)
+                self.stats['error_details'][host_name] = "Не удалось определить тип устройства"
+                return False
+            
+            # Rack (стойка) - НОВОЕ
+            rack = None
+            rack_position = None
+            rack_name = inventory.get('location_lat', '')  # Используем location_lat для имени стойки
+            rack_unit = inventory.get('location_lon', '')  # Используем location_lon для позиции U
+            
+            if rack_name:
+                rack = self.ensure_rack(rack_name, site)
+                if rack and rack_unit:
+                    try:
+                        rack_position = int(rack_unit)
+                    except ValueError:
+                        logger.warning(f"  Некорректная позиция U: {rack_unit}")
+            
+            # Платформа
+            platform = self.ensure_platform()
+            
+            # Роль устройства
+            device_role = self.netbox.dcim.device_roles.get(name='Server')
+            if not device_role:
+                if not config.DRY_RUN:
+                    device_role = self.netbox.dcim.device_roles.create(
+                        name='Server',
+                        slug='server',
+                        color='0000ff'
+                    )
+                    logger.info("  Создана роль: Server")
+            
+            # Custom fields с расширенными данными
+            memory_gb = DataNormalizer.normalize_memory(inventory.get('software_app_a'))
+            custom_fields = {
+                'cpu_model': inventory.get('hardware', ''),
+                'memory_size': str(memory_gb) if memory_gb else '',
+                'os_name': inventory.get('os', ''),
+                'os_version': inventory.get('os_short', ''),
+                'vsphere_cluster': inventory.get('alias', ''),
+                'rack_location': inventory.get('location', ''),
+                'zabbix_hostid': host_id,
+                'serial_number': inventory.get('serialno_a', ''),  # Серийный номер
+                'asset_tag': inventory.get('asset_tag', ''),       # Инвентарный номер
+                'rack_name': rack_name,                            # Имя стойки из Zabbix
+                'rack_unit': rack_unit,                            # Позиция U из Zabbix
+                'last_sync': datetime.now().isoformat()
+            }
+            
+            # Убираем пустые значения
+            custom_fields = {k: v for k, v in custom_fields.items() if v}
+            
+            # Проверяем существование устройства
+            device = self.netbox.dcim.devices.get(name=host_name)
+            
+            # Данные устройства
+            device_data = {
+                'name': host_name,
+                'device_type': device_type.id,
+                'role': device_role.id if device_role else None,
+                'site': site.id,
+                'status': 'active' if host_data.get('status') == '0' else 'offline',
+                'platform': platform.id if platform else None,
+                'location': location.id if location else None,
+                'rack': rack.id if rack else None,
+                'position': rack_position if rack_position else None,
+                'face': 'front' if rack else None,
+                'serial': inventory.get('serialno_a', ''),  # Серийный номер в основном поле
+                'asset_tag': inventory.get('asset_tag', ''),  # Инвентарный номер в основном поле
+                'custom_fields': custom_fields
+            }
+            
+            # Убираем None и пустые значения
+            device_data = {k: v for k, v in device_data.items() if v not in [None, '']}
+            
+            if device:
+                # Обновление существующего устройства
+                changes_made = []
+                
+                # Проверяем что изменилось
+                for field, new_value in device_data.items():
+                    if field == 'custom_fields':
+                        # Проверяем custom fields
+                        for cf_name, cf_value in new_value.items():
+                            old_cf_value = device.custom_fields.get(cf_name)
+                            if str(old_cf_value) != str(cf_value):
+                                changes_made.append(f"{cf_name}: {old_cf_value} → {cf_value}")
+                    else:
+                        # Проверяем обычные поля
+                        old_value = getattr(device, field, None)
+                        if hasattr(old_value, 'id'):
+                            old_value = old_value.id
+                        if str(old_value) != str(new_value):
+                            changes_made.append(f"{field}: {old_value} → {new_value}")
+                
+                if changes_made:
+                    if not config.DRY_RUN:
+                        device.update(device_data)
+                        logger.info(f"  ✓ Устройство обновлено")
+                        logger.info(f"    Изменения: {', '.join(changes_made[:3])}")  # Первые 3 изменения
+                        self.stats['changed_hosts'].append(host_name)
+                        self.stats['detailed_changes'][host_name] = changes_made
+                    else:
+                        logger.info(f"  [DRY RUN] Устройство будет обновлено")
+                        logger.info(f"    Изменения: {', '.join(changes_made[:3])}")
+                else:
+                    logger.info(f"  ℹ Устройство не изменилось")
+            else:
+                # Создание нового устройства
+                if not config.DRY_RUN:
+                    device = self.netbox.dcim.devices.create(**device_data)
+                    logger.info(f"  ✓ Устройство создано")
+                    if rack:
+                        logger.info(f"    Размещено в стойке {rack_name}, позиция U{rack_position}")
+                    self.stats['new_hosts'].append(host_name)
+                else:
+                    logger.info(f"  [DRY RUN] Устройство будет создано")
+                    if rack_name:
+                        logger.info(f"    Будет размещено в стойке {rack_name}, позиция U{rack_unit}")
+                    return True
+            
+            # IP адрес
+            if primary_ip and device:
+                interface, ip_address = self.sync_ip_address(primary_ip, device)
+            
+            return True
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"  ✗ Ошибка синхронизации {host_name}: {error_msg}")
+            self.stats['error_hosts'].append(host_name)
+            self.stats['error_details'][host_name] = error_msg
+            
+            # Rollback при ошибке
+            if not config.DRY_RUN:
+                self.rollback_device_creation(device, interface, ip_address)
+            
+            return False
     
     def ensure_location(self, location_name: str, site: Any) -> Optional[Any]:
         """Создание или получение локации"""
@@ -355,8 +684,9 @@ class ServerSync:
                     logger.info(f"    [DRY RUN] Будет создан интерфейс {interface_name}")
                     return None, None
             
-            # Работаем с IP (без маски, как вы просили)
-            ip_address = self.netbox.ipam.ip_addresses.get(address=f"{ip}/32")
+            # Работаем с IP
+            ip_with_mask = f"{ip}/32"
+            ip_address = self.netbox.ipam.ip_addresses.get(address=ip_with_mask)
             
             if ip_address:
                 if not ip_address.assigned_object or ip_address.assigned_object_id != interface.id:
@@ -368,7 +698,7 @@ class ServerSync:
             else:
                 if not config.DRY_RUN:
                     ip_address = self.netbox.ipam.ip_addresses.create(
-                        address=ip,
+                        address=ip_with_mask,
                         status='active',
                         assigned_object_type='dcim.interface',
                         assigned_object_id=interface.id,
@@ -426,132 +756,6 @@ class ServerSync:
         if rollback_log:
             logger.info(f"  Rollback выполнен: {', '.join(rollback_log)}")
     
-    def sync_device(self, host_data: Dict) -> bool:
-        """Синхронизация одного устройства в NetBox"""
-        host_id = host_data['hostid']
-        host_name = host_data.get('name', 'Unknown')
-        
-        # Валидация
-        is_valid, error = DataValidator.validate_host_data(host_data)
-        if not is_valid:
-            logger.warning(f"Хост {host_name} пропущен: {error}")
-            self.stats['skipped_hosts'].append(host_name)
-            return False
-        
-        logger.info(f"\nОбработка: {host_name} (ID: {host_id})")
-        
-        device = None
-        interface = None
-        ip_address = None
-        
-        try:
-            inventory = host_data.get('inventory', {})
-            
-            # IP и Site
-            primary_ip = IPHelper.get_primary_ip(host_data)
-            site_name = IPHelper.get_site_from_ip(primary_ip)
-            
-            site = self.netbox.dcim.sites.get(name=site_name)
-            if not site:
-                logger.error(f"  Site {site_name} не найден в NetBox")
-                self.stats['error_hosts'].append(host_name)
-                return False
-            
-            # Локация
-            location_name = config.LOCATION_MAPPING.get(site_name)
-            location = self.ensure_location(location_name, site) if location_name else None
-            
-            # Производитель и модель
-            manufacturer = self.ensure_manufacturer(inventory.get('vendor'))
-            device_type = self.ensure_device_type(inventory.get('model'), manufacturer)
-            
-            if not device_type:
-                logger.error(f"  Не удалось определить тип устройства")
-                self.stats['error_hosts'].append(host_name)
-                return False
-            
-            # Платформа
-            platform = None
-            
-            # Роль устройства
-            device_role = self.netbox.dcim.device_roles.get(name='Server')
-            if not device_role:
-                if not config.DRY_RUN:
-                    device_role = self.netbox.dcim.device_roles.create(
-                        name='Server',
-                        slug='server',
-                        color='0000ff'
-                    )
-                    logger.info("  Создана роль: Server")
-            
-            # Custom fields
-            memory_gb = DataNormalizer.normalize_memory(inventory.get('software_app_a'))
-            custom_fields = {
-                'cpu_model': inventory.get('hardware', ''),
-                'memory_size': str(memory_gb) if memory_gb else '',
-                'os_name': inventory.get('os', ''),
-                'os_version': inventory.get('os_short', ''),
-                'vsphere_cluster': inventory.get('alias', ''),  # Используем vsphere_cluster
-                'rack_location': inventory.get('location', ''),
-                'zabbix_hostid': host_id,
-                'last_sync': datetime.now().isoformat()
-            }
-            
-            # Убираем пустые значения
-            custom_fields = {k: v for k, v in custom_fields.items() if v}
-            
-            # Проверяем существование устройства
-            device = self.netbox.dcim.devices.get(name=host_name)
-            
-            # Данные устройства
-            device_data = {
-                'name': host_name,
-                'device_type': device_type.id,
-                'role': device_role.id,
-                'site': site.id,
-                'status': 'active' if host_data.get('status') == '0' else 'offline',
-                'platform': platform.id if platform else None,
-                'location': location.id if location else None,
-                'custom_fields': custom_fields
-            }
-            
-            # Убираем None
-            device_data = {k: v for k, v in device_data.items() if v is not None}
-            
-            if device:
-                # Обновление
-                if not config.DRY_RUN:
-                    device.update(device_data)
-                    logger.info(f"  ✓ Устройство обновлено")
-                    self.stats['changed_hosts'].append(host_name)
-                else:
-                    logger.info(f"  [DRY RUN] Устройство будет обновлено")
-            else:
-                # Создание
-                if not config.DRY_RUN:
-                    device = self.netbox.dcim.devices.create(**device_data)
-                    logger.info(f"  ✓ Устройство создано")
-                    self.stats['new_hosts'].append(host_name)
-                else:
-                    logger.info(f"  [DRY RUN] Устройство будет создано")
-                    return True
-            
-            # IP адрес
-            if primary_ip and device:
-                interface, ip_address = self.sync_ip_address(primary_ip, device)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"  ✗ Ошибка синхронизации {host_name}: {e}")
-            self.stats['error_hosts'].append(host_name)
-            
-            # Rollback при ошибке
-            if not config.DRY_RUN:
-                self.rollback_device_creation(device, interface, ip_address)
-            
-            return False
-    
     def run_sync(self) -> dict:
         """Запуск процесса синхронизации"""
         logger.info("=" * 60)
@@ -585,6 +789,10 @@ class ServerSync:
             for host in batch:
                 self.sync_device(host)
         
+        # Проверяем decommissioned устройства
+        logger.info("\nПроверка неактивных устройств...")
+        self.check_decommissioned_devices()
+        
         # Результаты
         success_count = len(self.stats['new_hosts']) + len(self.stats['changed_hosts'])
         error_count = len(self.stats['error_hosts'])
@@ -594,6 +802,7 @@ class ServerSync:
         logger.info(f"  ✓ Успешно: {success_count}")
         logger.info(f"  ✗ Ошибок: {error_count}")
         logger.info(f"  ⏭ Пропущено: {len(self.stats['skipped_hosts'])}")
+        logger.info(f"  🗑 Decommissioned: {len(self.stats['decommissioned_hosts'])}")
         
         if self.stats['new_models']:
             logger.warning(f"\n⚠️ Новые модели без U-height:")
@@ -649,29 +858,4 @@ class TelegramBot:
             
         except Exception as e:
             logger.error(f"Ошибка отправки в Telegram: {e}")
-            return False
-    
-    def send_document(self, file_path: str, caption: str = None) -> bool:
-        """Отправка файла в Telegram (например, лог файл)"""
-        try:
-            with open(file_path, 'rb') as file:
-                params = {
-                    'chat_id': self.chat_id,
-                    'caption': caption
-                }
-                files = {
-                    'document': file
-                }
-                
-                response = requests.post(
-                    f"{self.base_url}/sendDocument",
-                    data=params,
-                    files=files,
-                    timeout=30
-                )
-                
-                return response.status_code == 200
-                
-        except Exception as e:
-            logger.error(f"Ошибка отправки файла в Telegram: {e}")
             return False

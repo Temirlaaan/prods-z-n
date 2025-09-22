@@ -6,7 +6,7 @@ import re
 import hashlib
 import json
 import logging
-from typing import Dict, Optional, Any, Tuple
+from typing import Dict, Optional, Any, Tuple, List
 from datetime import datetime
 import config
 
@@ -168,7 +168,7 @@ class HashCalculator:
         """Создание хэша для отслеживания изменений"""
         inventory = host_data.get('inventory', {})
         
-        # Собираем значимые поля
+        # Собираем значимые поля, включая новые
         hash_data = {
             'name': host_data.get('name', ''),
             'vendor': DataNormalizer.normalize_vendor(inventory.get('vendor', '')),
@@ -180,7 +180,12 @@ class HashCalculator:
             'cluster': inventory.get('alias', ''),
             'location': inventory.get('location', ''),
             'ip': primary_ip or '',
-            'status': host_data.get('status', '')
+            'status': host_data.get('status', ''),
+            # Новые поля для отслеживания
+            'serial': inventory.get('serialno_a', ''),
+            'asset_tag': inventory.get('asset_tag', ''),
+            'rack_name': inventory.get('location_lat', ''),
+            'rack_unit': inventory.get('location_lon', '')
         }
         
         # Создаем стабильный хэш
@@ -249,10 +254,73 @@ class UHeightHelper:
                 if model in map_key:
                     return height
             
+            # Для Generic/Unknown моделей
+            if 'Generic' in key or 'Unknown' in key:
+                return 2  # Стандартный 2U
+            
             logger.warning(f"U-height не найден для '{key}'")
             return None
         
         return u_height
+
+
+class ChangeTracker:
+    """Отслеживание изменений между синхронизациями"""
+    
+    @staticmethod
+    def compare_hosts(old_host: Dict, new_host: Dict) -> List[str]:
+        """Сравнение двух версий хоста и возврат списка изменений"""
+        changes = []
+        
+        # Сравниваем основные поля
+        if old_host.get('name') != new_host.get('name'):
+            changes.append(f"Имя: {old_host.get('name')} → {new_host.get('name')}")
+        
+        if old_host.get('status') != new_host.get('status'):
+            old_status = 'active' if old_host.get('status') == '0' else 'offline'
+            new_status = 'active' if new_host.get('status') == '0' else 'offline'
+            changes.append(f"Статус: {old_status} → {new_status}")
+        
+        # Сравниваем inventory
+        old_inv = old_host.get('inventory', {})
+        new_inv = new_host.get('inventory', {})
+        
+        # Проверяем ключевые поля inventory
+        inventory_fields = {
+            'vendor': 'Производитель',
+            'model': 'Модель',
+            'serialno_a': 'Серийный номер',
+            'asset_tag': 'Инвентарный номер',
+            'hardware': 'CPU',
+            'software_app_a': 'Память',
+            'os': 'ОС',
+            'os_short': 'Версия ОС',
+            'alias': 'Кластер',
+            'location': 'Локация',
+            'location_lat': 'Стойка',
+            'location_lon': 'Позиция U'
+        }
+        
+        for field, name in inventory_fields.items():
+            old_val = old_inv.get(field, '')
+            new_val = new_inv.get(field, '')
+            if str(old_val) != str(new_val) and (old_val or new_val):
+                # Специальная обработка для памяти
+                if field == 'software_app_a':
+                    old_gb = DataNormalizer.normalize_memory(old_val)
+                    new_gb = DataNormalizer.normalize_memory(new_val)
+                    if old_gb != new_gb:
+                        changes.append(f"{name}: {old_gb}GB → {new_gb}GB")
+                else:
+                    changes.append(f"{name}: {old_val or 'пусто'} → {new_val or 'пусто'}")
+        
+        # Проверяем IP адреса
+        old_ip = IPHelper.get_primary_ip(old_host)
+        new_ip = IPHelper.get_primary_ip(new_host)
+        if old_ip != new_ip:
+            changes.append(f"IP: {old_ip} → {new_ip}")
+        
+        return changes
 
 
 class NotificationHelper:
@@ -261,8 +329,12 @@ class NotificationHelper:
     @staticmethod
     def format_sync_summary(new_hosts: list, changed_hosts: list, 
                            success_count: int, error_count: int,
-                           new_models: list = None, format_type: str = 'HTML') -> str:
-        """Форматирование итогов синхронизации для Telegram"""
+                           new_models: list = None, 
+                           decommissioned: list = None,
+                           detailed_changes: dict = None,
+                           error_details: dict = None,
+                           format_type: str = 'HTML') -> str:
+        """Форматирование детального отчета синхронизации для Telegram"""
         if format_type == 'HTML':
             lines = [
                 "📊 <b>Синхронизация Zabbix → NetBox завершена</b>",
@@ -272,6 +344,7 @@ class NotificationHelper:
                 ""
             ]
             
+            # Новые устройства
             if new_hosts:
                 lines.append(f"🆕 <b>Новые устройства ({len(new_hosts)}):</b>")
                 for host in new_hosts[:5]:  # Первые 5
@@ -280,14 +353,43 @@ class NotificationHelper:
                     lines.append(f"  <i>... и еще {len(new_hosts) - 5}</i>")
                 lines.append("")
             
+            # Измененные устройства с деталями
             if changed_hosts:
                 lines.append(f"🔄 <b>Измененные устройства ({len(changed_hosts)}):</b>")
-                for host in changed_hosts[:5]:  # Первые 5
+                for host in changed_hosts[:3]:  # Первые 3 с деталями
                     lines.append(f"  • <code>{host}</code>")
-                if len(changed_hosts) > 5:
-                    lines.append(f"  <i>... и еще {len(changed_hosts) - 5}</i>")
+                    if detailed_changes and host in detailed_changes:
+                        changes = detailed_changes[host][:2]  # Первые 2 изменения
+                        for change in changes:
+                            lines.append(f"    → {change}")
+                        if len(detailed_changes[host]) > 2:
+                            lines.append(f"    → <i>... и еще {len(detailed_changes[host]) - 2} изменений</i>")
+                if len(changed_hosts) > 3:
+                    lines.append(f"  <i>... и еще {len(changed_hosts) - 3} устройств</i>")
                 lines.append("")
             
+            # Decommissioned устройства
+            if decommissioned:
+                lines.append(f"🗑 <b>Decommissioned ({len(decommissioned)}):</b>")
+                for host in decommissioned[:3]:
+                    lines.append(f"  • <code>{host}</code>")
+                if len(decommissioned) > 3:
+                    lines.append(f"  <i>... и еще {len(decommissioned) - 3}</i>")
+                lines.append("")
+            
+            # Ошибки с деталями
+            if error_details:
+                lines.append(f"❌ <b>Детали ошибок:</b>")
+                for host, error in list(error_details.items())[:3]:
+                    lines.append(f"  • <code>{host}</code>")
+                    # Обрезаем длинные ошибки
+                    error_msg = error if len(error) < 100 else error[:97] + "..."
+                    lines.append(f"    → {error_msg}")
+                if len(error_details) > 3:
+                    lines.append(f"  <i>... и еще {len(error_details) - 3} ошибок</i>")
+                lines.append("")
+            
+            # Новые модели
             if new_models:
                 lines.append(f"⚠️ <b>Новые модели без U-height ({len(new_models)}):</b>")
                 for model in new_models[:3]:
@@ -297,6 +399,7 @@ class NotificationHelper:
                 lines.append("<i>Добавьте в U_HEIGHT_MAPPING</i>")
             
             lines.append(f"\n🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            
         else:  # Markdown
             lines = [
                 "📊 *Синхронизация Zabbix → NetBox завершена*",
@@ -316,10 +419,34 @@ class NotificationHelper:
             
             if changed_hosts:
                 lines.append(f"🔄 *Измененные устройства ({len(changed_hosts)}):*")
-                for host in changed_hosts[:5]:
+                for host in changed_hosts[:3]:
                     lines.append(f"  • `{host}`")
-                if len(changed_hosts) > 5:
-                    lines.append(f"  _... и еще {len(changed_hosts) - 5}_")
+                    if detailed_changes and host in detailed_changes:
+                        changes = detailed_changes[host][:2]
+                        for change in changes:
+                            lines.append(f"    → {change}")
+                        if len(detailed_changes[host]) > 2:
+                            lines.append(f"    → _... и еще {len(detailed_changes[host]) - 2} изменений_")
+                if len(changed_hosts) > 3:
+                    lines.append(f"  _... и еще {len(changed_hosts) - 3} устройств_")
+                lines.append("")
+            
+            if decommissioned:
+                lines.append(f"🗑 *Decommissioned ({len(decommissioned)}):*")
+                for host in decommissioned[:3]:
+                    lines.append(f"  • `{host}`")
+                if len(decommissioned) > 3:
+                    lines.append(f"  _... и еще {len(decommissioned) - 3}_")
+                lines.append("")
+            
+            if error_details:
+                lines.append(f"❌ *Детали ошибок:*")
+                for host, error in list(error_details.items())[:3]:
+                    lines.append(f"  • `{host}`")
+                    error_msg = error if len(error) < 100 else error[:97] + "..."
+                    lines.append(f"    → {error_msg}")
+                if len(error_details) > 3:
+                    lines.append(f"  _... и еще {len(error_details) - 3} ошибок_")
                 lines.append("")
             
             if new_models:

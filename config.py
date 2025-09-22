@@ -53,7 +53,8 @@ SITE_MAPPING = {
     '10.127': 'DC Almaty',
     '10.13': 'DC Karaganda',
     '10.14': 'DC Atyrau',
-    '10.10': 'DC Konaeva10'
+    '10.10': 'DC Konaeva10',
+    '192.168': 'DC Konaeva10'  # Добавлено для решения ошибки
 }
 
 # Site → Location
@@ -69,6 +70,8 @@ LOCATION_MAPPING = {
 U_HEIGHT_MAPPING = {
     'Dell Inc. PowerEdge R640': 1,
     'Dell Inc. PowerEdge R740': 2,
+    'Dell PowerEdge R640': 1,
+    'Dell PowerEdge R740': 2,
     'HPE ProLiant DL360 Gen10': 1,
     'HPE ProLiant DL380 Gen10': 2,
     'Huawei CH121 V3': 1,
@@ -82,22 +85,57 @@ U_HEIGHT_MAPPING = {
     'Lenovo ThinkSystem SR645': 1,
     'Lenovo ThinkSystem SR650': 2,
     'VMware Virtual Platform': 0,  # Виртуальная машина
+    
+    # Добавляем маппинги для Unknown моделей
+    'Dell Unknown': 2,
+    'HPE Unknown': 2,
+    'Huawei Unknown': 2,
+    'Lenovo Unknown': 2,
+    'Unknown Unknown': 2,
+    'Generic Server': 2
 }
 
 # Default Site если не определен по IP
 DEFAULT_SITE = 'DC Konaeva10'
 
 # === CUSTOM FIELDS в NetBox ===
+# ВАЖНО: Эти поля должны быть созданы в NetBox UI
 CUSTOM_FIELDS = [
-    'cpu_model',
-    'memory_size',
-    'os_name',
-    'os_version',
-    'vsphere_cluster',
-    'rack_location',
-    'zabbix_hostid',
-    'last_sync'
+    'cpu_model',        # Модель процессора
+    'memory_size',      # Размер памяти
+    'os_name',          # Имя ОС
+    'os_version',       # Версия ОС
+    'vsphere_cluster',  # vSphere кластер
+    'rack_location',    # Локация в стойке (текст)
+    'zabbix_hostid',    # ID хоста в Zabbix
+    'last_sync',        # Последняя синхронизация
+    'serial_number',    # Серийный номер
+    'asset_tag',        # Инвентарный номер
+    'rack_name',        # Имя стойки из Zabbix
+    'rack_unit',        # Позиция U в стойке
 ]
+
+# === МАППИНГ ПОЛЕЙ ZABBIX → NETBOX ===
+# Как поля из Zabbix inventory мапятся в NetBox
+ZABBIX_TO_NETBOX_MAPPING = {
+    # Основные данные
+    'vendor': 'manufacturer',
+    'model': 'device_type',
+    'serialno_a': 'serial_number',     # Серийный номер
+    'asset_tag': 'asset_tag',          # Инвентарный номер
+    
+    # Расположение
+    'location': 'rack_location',       # Текстовое описание локации
+    'location_lat': 'rack_name',       # Используем lat для имени стойки
+    'location_lon': 'rack_unit',       # Используем lon для позиции U
+    
+    # Характеристики
+    'hardware': 'cpu_model',
+    'software_app_a': 'memory_size',
+    'os': 'os_name',
+    'os_short': 'os_version',
+    'alias': 'vsphere_cluster',
+}
 
 # === ФИЛЬТРЫ ДЛЯ ZABBIX ===
 # Шаблоны для исключения
@@ -118,6 +156,13 @@ EXCLUDED_GROUPS = [
 INCLUDED_TEMPLATES = [
     'VMware Hypervisor'
 ]
+
+# === НАСТРОЙКИ УДАЛЕНИЯ ===
+# Через сколько дней неактивности помечать устройство как decommissioned
+DECOMMISSION_AFTER_DAYS = int(os.getenv('DECOMMISSION_AFTER_DAYS', '30'))
+
+# Удалять ли устройства физически из NetBox
+DELETE_DECOMMISSIONED = os.getenv('DELETE_DECOMMISSIONED', 'false').lower() == 'true'
 
 # === ВАЛИДАЦИЯ ===
 def validate_config():

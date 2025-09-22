@@ -6,9 +6,13 @@ import sys
 import logging
 import argparse
 from datetime import datetime
+import urllib3
 import config
 from sync import ServerSync
 from utils import NotificationHelper
+
+# Отключаем предупреждения SSL
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Настройка логирования
 def setup_logging():
@@ -85,6 +89,12 @@ def parse_arguments():
         help='Только проверить конфигурацию'
     )
     
+    parser.add_argument(
+        '--check-decommissioned',
+        action='store_true',
+        help='Проверить и пометить неактивные устройства'
+    )
+    
     return parser.parse_args()
 
 
@@ -150,14 +160,17 @@ def main():
         # Запускаем синхронизацию
         stats = sync.run_sync()
         
-        # Отправляем уведомление
+        # Отправляем детальное уведомление
         if config.TELEGRAM_ENABLED:
             message = NotificationHelper.format_sync_summary(
                 stats['new_hosts'],
                 stats['changed_hosts'],
                 len(stats['new_hosts']) + len(stats['changed_hosts']),
                 len(stats['error_hosts']),
-                stats['new_models'],
+                new_models=stats['new_models'],
+                decommissioned=stats['decommissioned_hosts'],
+                detailed_changes=stats.get('detailed_changes', {}),
+                error_details=stats.get('error_details', {}),
                 format_type=config.TELEGRAM_PARSE_MODE
             )
             sync.send_telegram_notification(message)
