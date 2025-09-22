@@ -382,16 +382,31 @@ class ServerSync:
             return None
     
     def ensure_rack(self, rack_name: str, site: Any, location: Any = None) -> Optional[Any]:
-        """Создание или получение стойки"""
+        """Создание или получение стойки с проверкой/обновлением локации"""
         if not rack_name or not site:
             return None
         
         try:
-            # Ищем стойку только по site (не по location!)
+            # Ищем стойку по name и site (как раньше)
             rack = self.netbox.dcim.racks.get(
                 name=rack_name,
                 site_id=site.id
             )
+            
+            if rack:
+                # Проверяем локацию, если задана
+                if location:
+                    current_location_id = rack.location.id if rack.location else None
+                    if current_location_id != location.id:
+                        if not config.DRY_RUN:
+                            rack.location = location.id
+                            rack.save()
+                            logger.info(f"  Обновлена локация стойки {rack_name} на {location.name}")
+                        else:
+                            logger.info(f"  [DRY RUN] Будет обновлена локация стойки {rack_name}")
+                        # Если разная локация, можно добавить предупреждение
+                        if current_location_id:
+                            logger.warning(f"  Внимание: Изменена локация стойки {rack_name} с {rack.location.name} на {location.name}")
             
             if not rack:
                 rack_data = {
@@ -405,7 +420,6 @@ class ServerSync:
                 }
                 
                 # Location добавляем только если она существует
-                # НО: в NetBox location не обязательна для rack
                 if location:
                     rack_data['location'] = location.id
                 
@@ -414,7 +428,7 @@ class ServerSync:
                     logger.info(f"  Создана стойка: {rack_name} в site {site.name}")
                 else:
                     logger.info(f"  [DRY RUN] Будет создана стойка: {rack_name}")
-                    return None
+                    return None  # В dry-run не возвращаем объект
         
             return rack
         except Exception as e:
