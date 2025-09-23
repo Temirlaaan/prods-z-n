@@ -549,7 +549,7 @@ class ServerSync:
                 'role': device_role.id if device_role else None,
                 'site': site.id,
                 'status': 'active' if host_data.get('status') == '0' else 'offline',
-                'platform': platform.id if platform else None,
+                #'platform': platform.id if platform else None,
                 'location': location.id if location else None,  # Location для device
                 'serial': inventory.get('serialno_a', ''),
                 'asset_tag': inventory.get('asset_tag', ''),
