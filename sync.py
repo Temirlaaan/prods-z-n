@@ -179,6 +179,7 @@ class ServerSync:
         """Проверка изменений через Redis с детальным отслеживанием"""
         if not self.redis_client:
             # Без Redis все хосты считаются новыми
+            logger.debug("Redis отключен, все хосты считаются новыми")
             return hosts, []
         
         new_hosts = []
@@ -198,8 +199,10 @@ class ServerSync:
                 old_data = self.redis_client.get(redis_data_key)
                 
                 if old_hash is None:
+                    logger.debug(f"Хост {host_name} новый (нет ключа в Redis)")
                     new_hosts.append(host)
                 elif old_hash != current_hash:
+                    logger.debug(f"Хост {host_name} изменился (хэш отличается)")
                     changed_hosts.append(host)
                     
                     # Отслеживаем что именно изменилось
@@ -209,21 +212,17 @@ class ServerSync:
                             changes = self.change_tracker.compare_hosts(old_host_data, host)
                             if changes:
                                 self.stats['detailed_changes'][host_name] = changes
+                                logger.debug(f"Изменения для {host_name}: {changes}")
                         except json.JSONDecodeError:
                             logger.warning(f"Не удалось декодировать старые данные для {host_name}")
                 
-                # Обновляем хэш и данные с TTL
-                self.redis_client.setex(redis_key, config.REDIS_TTL, current_hash)
-                self.redis_client.setex(redis_data_key, config.REDIS_TTL, json.dumps(host))
-                
             except Exception as e:
                 logger.warning(f"Ошибка работы с Redis для хоста {host_id}: {e}")
-                changed_hosts.append(host)
+                changed_hosts.append(host)  # Считаем измененным при ошибке Redis
         
+        logger.info(f"Найдено новых: {len(new_hosts)}, измененных: {len(changed_hosts)}")
         return new_hosts, changed_hosts
     
-   # В файле sync.py найдите и замените метод check_decommissioned_devices:
-
     def check_decommissioned_devices(self):
         """Проверка и пометка неактивных устройств как decommissioning"""
         if not self.redis_client:
@@ -441,6 +440,7 @@ class ServerSync:
         """Синхронизация одного устройства в NetBox с расширенной поддержкой"""
         host_id = host_data['hostid']
         host_name = host_data.get('name', 'Unknown')
+        primary_ip = IPHelper.get_primary_ip(host_data)  # Получаем IP заранее для хэша
         
         # Валидация
         is_valid, error = DataValidator.validate_host_data(host_data)
@@ -463,9 +463,10 @@ class ServerSync:
                 logger.debug(f"  Inventory для {host_name}: {json.dumps(inventory, indent=2)}")
             
             # IP и Site
-            primary_ip = IPHelper.get_primary_ip(host_data)
-            site_name = IPHelper.get_site_from_ip(primary_ip)
+            if not primary_ip:
+                logger.warning(f"  Нет валидного IP для {host_name}")
             
+            site_name = IPHelper.get_site_from_ip(primary_ip)
             site = self.netbox.dcim.sites.get(name=site_name)
             if not site:
                 logger.error(f"  Site {site_name} не найден в NetBox")
@@ -479,23 +480,28 @@ class ServerSync:
             
             # Производитель и модель
             manufacturer = self.ensure_manufacturer(inventory.get('vendor'))
+            if not manufacturer:
+                logger.error(f"  Не удалось определить производителя для {host_name}")
+                self.stats['error_hosts'].append(host_name)
+                self.stats['error_details'][host_name] = "Не удалось определить производителя"
+                return False
+            
             device_type = self.ensure_device_type(
                 inventory.get('model'), 
                 manufacturer, 
-                host_data  # Передаем host_data для лучшего определения модели
+                host_data
             )
-            
             if not device_type:
-                logger.error(f"  Не удалось определить тип устройства")
+                logger.error(f"  Не удалось определить тип устройства для {host_name}")
                 self.stats['error_hosts'].append(host_name)
                 self.stats['error_details'][host_name] = "Не удалось определить тип устройства"
                 return False
             
-            # Rack (стойка) - НОВОЕ
+            # Rack (стойка) - ИЗМЕНЕНО
             rack = None
             rack_position = None
-            rack_name = inventory.get('location_lat', '')  # Используем location_lat для имени стойки
-            rack_unit = inventory.get('location_lon', '')  # Используем location_lon для позиции U
+            rack_name = inventory.get('software_app_b', '')  # Используем software_app_b
+            rack_unit = inventory.get('location_lon', '')
             
             if rack_name:
                 rack = self.ensure_rack(rack_name, site, location)
@@ -519,7 +525,7 @@ class ServerSync:
                     )
                     logger.info("  Создана роль: Server")
             
-            # Custom fields с расширенными данными
+            # Custom fields
             memory_gb = DataNormalizer.normalize_memory(inventory.get('software_app_a'))
             custom_fields = {
                 'cpu_model': inventory.get('hardware', ''),
@@ -529,14 +535,12 @@ class ServerSync:
                 'vsphere_cluster': inventory.get('alias', ''),
                 'rack_location': inventory.get('location', ''),
                 'zabbix_hostid': host_id,
-                'serial_number': inventory.get('serialno_a', ''),  # Серийный номер
-                'asset_tag': inventory.get('asset_tag', ''),       # Инвентарный номер
-                'rack_name': rack_name,                            # Имя стойки из Zabbix
-                'rack_unit': rack_unit,                            # Позиция U из Zabbix
+                'serial_number': inventory.get('serialno_a', ''),
+                'asset_tag': inventory.get('asset_tag', ''),
+                'rack_name': rack_name,
+                'rack_unit': rack_unit,
                 'last_sync': datetime.now().isoformat()
             }
-            
-            # Убираем пустые значения
             custom_fields = {k: v for k, v in custom_fields.items() if v}
             
             # Проверяем существование устройства
@@ -549,36 +553,30 @@ class ServerSync:
                 'role': device_role.id if device_role else None,
                 'site': site.id,
                 'status': 'active' if host_data.get('status') == '0' else 'offline',
-                #'platform': platform.id if platform else None,
-                'location': location.id if location else None,  # Location для device
+                'location': location.id if location else None,
                 'serial': inventory.get('serialno_a', ''),
                 'asset_tag': inventory.get('asset_tag', ''),
                 'custom_fields': custom_fields
             }
-
+            
             if rack:
                 device_data['rack'] = rack.id
                 if rack_position:
                     device_data['position'] = rack_position
                     device_data['face'] = 'front'
             
-            # Убираем None и пустые значения
             device_data = {k: v for k, v in device_data.items() if v not in [None, '']}
             
             if device:
                 # Обновление существующего устройства
                 changes_made = []
-                
-                # Проверяем что изменилось
                 for field, new_value in device_data.items():
                     if field == 'custom_fields':
-                        # Проверяем custom fields
                         for cf_name, cf_value in new_value.items():
                             old_cf_value = device.custom_fields.get(cf_name)
                             if str(old_cf_value) != str(cf_value):
                                 changes_made.append(f"{cf_name}: {old_cf_value} → {cf_value}")
                     else:
-                        # Проверяем обычные поля
                         old_value = getattr(device, field, None)
                         if hasattr(old_value, 'id'):
                             old_value = old_value.id
@@ -589,9 +587,18 @@ class ServerSync:
                     if not config.DRY_RUN:
                         device.update(device_data)
                         logger.info(f"  ✓ Устройство обновлено")
-                        logger.info(f"    Изменения: {', '.join(changes_made[:3])}")  # Первые 3 изменения
+                        logger.info(f"    Изменения: {', '.join(changes_made[:3])}")
                         self.stats['changed_hosts'].append(host_name)
                         self.stats['detailed_changes'][host_name] = changes_made
+                        
+                        # Обновляем Redis после успешного обновления
+                        if self.redis_client:
+                            current_hash = HashCalculator.calculate_host_hash(host_data, primary_ip)
+                            redis_key = f"{config.REDIS_KEY_PREFIX}{host_id}"
+                            redis_data_key = f"{config.REDIS_KEY_PREFIX}data:{host_id}"
+                            self.redis_client.setex(redis_key, config.REDIS_TTL, current_hash)
+                            self.redis_client.setex(redis_data_key, config.REDIS_TTL, json.dumps(host_data))
+                            logger.debug(f"Redis обновлен для {host_name}")
                     else:
                         logger.info(f"  [DRY RUN] Устройство будет обновлено")
                         logger.info(f"    Изменения: {', '.join(changes_made[:3])}")
@@ -605,11 +612,19 @@ class ServerSync:
                     if rack:
                         logger.info(f"    Размещено в стойке {rack_name}, позиция U{rack_position}")
                     self.stats['new_hosts'].append(host_name)
+                    
+                    # Обновляем Redis после успешного создания
+                    if self.redis_client:
+                        current_hash = HashCalculator.calculate_host_hash(host_data, primary_ip)
+                        redis_key = f"{config.REDIS_KEY_PREFIX}{host_id}"
+                        redis_data_key = f"{config.REDIS_KEY_PREFIX}data:{host_id}"
+                        self.redis_client.setex(redis_key, config.REDIS_TTL, current_hash)
+                        self.redis_client.setex(redis_data_key, config.REDIS_TTL, json.dumps(host_data))
+                        logger.debug(f"Redis обновлен для {host_name}")
                 else:
                     logger.info(f"  [DRY RUN] Устройство будет создано")
                     if rack_name:
                         logger.info(f"    Будет размещено в стойке {rack_name}, позиция U{rack_unit}")
-                    return True
             
             # IP адрес
             if primary_ip and device:
@@ -628,7 +643,7 @@ class ServerSync:
                 self.rollback_device_creation(device, interface, ip_address)
             
             return False
-    
+        
     def ensure_location(self, location_name: str, site: Any) -> Optional[Any]:
         """Создание или получение локации"""
         if not location_name:

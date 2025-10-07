@@ -126,7 +126,7 @@ ZABBIX_TO_NETBOX_MAPPING = {
     
     # Расположение
     'location': 'rack_location',       # Текстовое описание локации
-    'location_lat': 'rack_name',       # Используем lat для имени стойки
+    'software_app_b': 'rack_name',       # Используем lat для имени стойки
     'location_lon': 'rack_unit',       # Используем lon для позиции U
     
     # Характеристики
