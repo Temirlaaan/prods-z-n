@@ -184,7 +184,7 @@ class HashCalculator:
             # Новые поля для отслеживания
             'serial': inventory.get('serialno_a', ''),
             'asset_tag': inventory.get('asset_tag', ''),
-            'rack_name': inventory.get('location_lat', ''),
+            'rack_name': inventory.get('software_app_b', ''),
             'rack_unit': inventory.get('location_lon', '')
         }
         
@@ -297,7 +297,7 @@ class ChangeTracker:
             'os_short': 'Версия ОС',
             'alias': 'Кластер',
             'location': 'Локация',
-            'location_lat': 'Стойка',
+            'software_app_b': 'Стойка',
             'location_lon': 'Позиция U'
         }
         

@@ -19,6 +19,7 @@ from utils import (
 
 logger = logging.getLogger(__name__)
 
+
 class ServerSync:
     """Основной класс синхронизации"""
     
@@ -567,10 +568,8 @@ class ServerSync:
             device_data = {k: v for k, v in device_data.items() if v not in [None, '']}
             
             if device:
-                # ИСПРАВЛЕНИЕ: Обновление существующего устройства
+                # Обновление существующего устройства
                 changes_made = []
-                
-                # Проверяем изменения в полях включая rack
                 for field, new_value in device_data.items():
                     if field == 'custom_fields':
                         for cf_name, cf_value in new_value.items():
@@ -579,29 +578,10 @@ class ServerSync:
                                 changes_made.append(f"{cf_name}: {old_cf_value} → {cf_value}")
                     else:
                         old_value = getattr(device, field, None)
-                        
-                        # Специальная обработка для rack и position
-                        if field == 'rack':
-                            old_rack_id = device.rack.id if device.rack else None
-                            if old_rack_id != new_value:
-                                old_rack_name = device.rack.name if device.rack else 'не указана'
-                                changes_made.append(f"rack: {old_rack_name} → {rack_name}")
-                        elif field == 'position':
-                            old_position = device.position
-                            if old_position != new_value:
-                                changes_made.append(f"position: U{old_position} → U{new_value}")
-                        else:
-                            if hasattr(old_value, 'id'):
-                                old_value = old_value.id
-                            if str(old_value) != str(new_value):
-                                changes_made.append(f"{field}: {old_value} → {new_value}")
-                
-                # ВАЖНО: Также проверяем если стойка была удалена в Zabbix
-                if not rack_name and device.rack:
-                    changes_made.append(f"rack: {device.rack.name} → удалена")
-                    device_data['rack'] = None
-                    device_data['position'] = None
-                    device_data['face'] = None
+                        if hasattr(old_value, 'id'):
+                            old_value = old_value.id
+                        if str(old_value) != str(new_value):
+                            changes_made.append(f"{field}: {old_value} → {new_value}")
                 
                 if changes_made:
                     if not config.DRY_RUN:
@@ -873,6 +853,7 @@ class ServerSync:
         logger.info("=" * 60)
         
         return self.stats
+
 
 class TelegramBot:
     """Класс для работы с Telegram Bot API"""
