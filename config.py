@@ -113,6 +113,7 @@ CUSTOM_FIELDS = [
     'asset_tag',        # Инвентарный номер
     'rack_name',        # Имя стойки из Zabbix
     'rack_unit',        # Позиция U в стойке
+    'decommissioned_date',  # НОВОЕ: Дата decommissioning
 ]
 
 # === МАППИНГ ПОЛЕЙ ZABBIX → NETBOX ===
@@ -163,6 +164,28 @@ DECOMMISSION_AFTER_DAYS = int(os.getenv('DECOMMISSION_AFTER_DAYS', '30'))
 
 # Удалять ли устройства физически из NetBox
 DELETE_DECOMMISSIONED = os.getenv('DELETE_DECOMMISSIONED', 'false').lower() == 'true'
+
+# Через сколько дней в статусе decommissioning удалять физически
+DELETE_AFTER_DECOMMISSION_DAYS = int(os.getenv('DELETE_AFTER_DECOMMISSION_DAYS', '90'))
+
+# Включить физическое удаление (ОСТОРОЖНО!)
+ENABLE_PHYSICAL_DELETION = os.getenv('ENABLE_PHYSICAL_DELETION', 'false').lower() == 'true'
+
+# === НАСТРОЙКИ ЗАЩИТЫ ДАННЫХ ===
+# Поля которые НЕ должны перезаписываться из Zabbix
+PROTECTED_FIELDS_STR = os.getenv('PROTECTED_FIELDS', '')
+PROTECTED_FIELDS = set(filter(None, PROTECTED_FIELDS_STR.split(',')))
+
+# Custom fields которые НЕ перезаписываются
+PROTECTED_CUSTOM_FIELDS_STR = os.getenv('PROTECTED_CUSTOM_FIELDS', '')
+PROTECTED_CUSTOM_FIELDS = set(filter(None, PROTECTED_CUSTOM_FIELDS_STR.split(',')))
+
+# === НАСТРОЙКИ ОЧИСТКИ ===
+# Что делать с orphaned IP адресами
+ORPHANED_IP_ACTION = os.getenv('ORPHANED_IP_ACTION', 'deprecated')  # deprecated, delete, keep
+
+# Проверять конфликты позиций в стойках
+CHECK_RACK_CONFLICTS = os.getenv('CHECK_RACK_CONFLICTS', 'true').lower() == 'true'
 
 # === ВАЛИДАЦИЯ ===
 def validate_config():

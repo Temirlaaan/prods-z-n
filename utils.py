@@ -101,23 +101,51 @@ class DataNormalizer:
     
     @staticmethod
     def normalize_vendor(vendor: str) -> str:
-        """Нормализация имени производителя"""
+        """Нормализация имени производителя с улучшенной обработкой"""
         if not vendor or vendor == 'N/A':
             return 'Unknown'
-        
-        # Маппинг известных вариантов
-        vendor_mapping = {
-            'Dell Inc.': 'Dell',
-            'DELL': 'Dell',
-            'Hewlett Packard Enterprise': 'HPE',
-            'HP': 'HPE',
-            'Huawei Technologies Co., Ltd.': 'Huawei',
-            'LENOVO': 'Lenovo',
-            'VMware, Inc.': 'VMware',
-        }
-        
+
+        # Очистка
         vendor = vendor.strip()
-        return vendor_mapping.get(vendor, vendor)
+
+        # Маппинг известных вариантов (с учетом регистра)
+        vendor_mapping = {
+            'dell inc.': 'Dell',
+            'dell inc': 'Dell',
+            'dell': 'Dell',
+            'hewlett packard enterprise': 'HPE',
+            'hewlett-packard': 'HPE',
+            'hp': 'HPE',
+            'hpe': 'HPE',
+            'huawei technologies co., ltd.': 'Huawei',
+            'huawei technologies co., ltd': 'Huawei',
+            'huawei': 'Huawei',
+            'lenovo': 'Lenovo',
+            'vmware, inc.': 'VMware',
+            'vmware, inc': 'VMware',
+            'vmware': 'VMware',
+            'cisco systems, inc.': 'Cisco',
+            'cisco systems': 'Cisco',
+            'cisco': 'Cisco',
+        }
+
+        # Проверяем прямое совпадение (case-insensitive)
+        vendor_lower = vendor.lower()
+        if vendor_lower in vendor_mapping:
+            return vendor_mapping[vendor_lower]
+
+        # Убираем типичные суффиксы
+        suffixes = [', inc.', ', inc', ' inc.', ' inc', ', ltd.', ', ltd', ' ltd.', ' ltd',
+                   ', llc', ' llc', ', co.', ' co.', ' corporation', ' corp.', ' corp']
+        vendor_clean = vendor_lower
+        for suffix in suffixes:
+            if vendor_clean.endswith(suffix):
+                vendor_clean = vendor_clean[:-len(suffix)].strip()
+                if vendor_clean in vendor_mapping:
+                    return vendor_mapping[vendor_clean]
+
+        # Если не нашли в маппинге, возвращаем оригинальное имя (но очищенное)
+        return vendor
     
     @staticmethod
     def normalize_model(model: str) -> str:

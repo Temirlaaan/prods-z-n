@@ -33,10 +33,14 @@ class ServerSync:
             'changed_hosts': [],
             'error_hosts': [],
             'decommissioned_hosts': [],
+            'deleted_hosts': [],      # НОВОЕ: Физически удаленные
+            'recovered_hosts': [],    # НОВОЕ: Восстановленные из decommissioning
+            'renamed_hosts': [],      # НОВОЕ: Переименованные устройства
             'new_models': [],
             'skipped_hosts': [],
-            'detailed_changes': {},  # Детальные изменения по хостам
-            'error_details': {}      # Детали ошибок
+            'rack_conflicts': [],     # НОВОЕ: Конфликты позиций в стойках
+            'detailed_changes': {},   # Детальные изменения по хостам
+            'error_details': {}       # Детали ошибок
         }
     
     def connect_services(self) -> bool:
@@ -223,54 +227,96 @@ class ServerSync:
         return new_hosts, changed_hosts
     
     def check_decommissioned_devices(self):
-        """Проверка и пометка неактивных устройств как decommissioning"""
+        """Проверка и пометка неактивных устройств как decommissioning + удаление (FIX #2)"""
         if not self.redis_client:
             return
-        
+
         try:
-            # Получаем все устройства из NetBox с custom field zabbix_hostid
-            netbox_devices = self.netbox.dcim.devices.filter(
-                cf_zabbix_hostid__n=False,  # Не null
-                status='active'
-            )
-            
             # Получаем все активные хосты из Zabbix
             active_host_ids = set()
             for host in self.get_vmware_hosts():
                 active_host_ids.add(host['hostid'])
-            
-            # Проверяем каждое устройство
+
+            # 1. Проверяем активные устройства для decommissioning
+            netbox_devices = self.netbox.dcim.devices.filter(
+                cf_zabbix_hostid__n=False,  # Не null
+                status='active'
+            )
+
             for device in netbox_devices:
                 zabbix_hostid = device.custom_fields.get('zabbix_hostid')
                 if zabbix_hostid and zabbix_hostid not in active_host_ids:
-                    # Проверяем когда последний раз видели
-                    last_seen_key = f"{config.REDIS_KEY_PREFIX}lastseen:{zabbix_hostid}"
-                    last_seen = self.redis_client.get(last_seen_key)
-                    
-                    if last_seen:
-                        last_seen_date = datetime.fromisoformat(last_seen)
-                        days_inactive = (datetime.now() - last_seen_date).days
-                        
-                        if days_inactive > config.DECOMMISSION_AFTER_DAYS:
-                            if not config.DRY_RUN:
-                                device.status = 'decommissioning'  # НЕ decommissioned!
-                                device.save()
-                                logger.info(f"Устройство {device.name} помечено как decommissioning (неактивно {days_inactive} дней)")
-                            else:
-                                logger.info(f"[DRY RUN] Устройство {device.name} будет помечено как decommissioning")
-                            
-                            self.stats['decommissioned_hosts'].append(device.name)
-                    else:
-                        # Первый раз не видим - записываем дату
-                        self.redis_client.set(last_seen_key, datetime.now().isoformat())
-            
+                    self._mark_as_decommissioning(device, zabbix_hostid)
+
+            # 2. FIX #2: Проверяем устройства в decommissioning для физического удаления
+            if config.ENABLE_PHYSICAL_DELETION:
+                decommissioning_devices = self.netbox.dcim.devices.filter(
+                    status='decommissioning'
+                )
+
+                for device in decommissioning_devices:
+                    self._check_for_deletion(device)
+
             # Обновляем last_seen для активных хостов
             for host_id in active_host_ids:
                 last_seen_key = f"{config.REDIS_KEY_PREFIX}lastseen:{host_id}"
                 self.redis_client.set(last_seen_key, datetime.now().isoformat())
-                
+
         except Exception as e:
-            logger.error(f"Ошибка при проверке decommissioning устройств: {e}")
+            logger.error(f"Ошибка при проверке decommissioned устройств: {e}")
+
+    def _mark_as_decommissioning(self, device: Any, zabbix_hostid: str):
+        """Пометить устройство как decommissioning"""
+        last_seen_key = f"{config.REDIS_KEY_PREFIX}lastseen:{zabbix_hostid}"
+        last_seen = self.redis_client.get(last_seen_key)
+
+        if last_seen:
+            last_seen_date = datetime.fromisoformat(last_seen)
+            days_inactive = (datetime.now() - last_seen_date).days
+
+            if days_inactive > config.DECOMMISSION_AFTER_DAYS:
+                if not config.DRY_RUN:
+                    device.status = 'decommissioning'
+                    # Добавляем дату decommissioning
+                    device.custom_fields['decommissioned_date'] = datetime.now().isoformat()
+                    device.save()
+                    logger.info(f"Устройство {device.name} помечено как decommissioning (неактивно {days_inactive} дней)")
+                else:
+                    logger.info(f"[DRY RUN] Устройство {device.name} будет помечено как decommissioning")
+
+                self.stats['decommissioned_hosts'].append(device.name)
+        else:
+            # Первый раз не видим - записываем дату
+            self.redis_client.set(last_seen_key, datetime.now().isoformat())
+
+    def _check_for_deletion(self, device: Any):
+        """Проверить и удалить устройство если прошло достаточно времени (FIX #2)"""
+        decommissioned_date_str = device.custom_fields.get('decommissioned_date')
+
+        if not decommissioned_date_str:
+            # Если даты нет, устанавливаем сейчас
+            if not config.DRY_RUN:
+                device.custom_fields['decommissioned_date'] = datetime.now().isoformat()
+                device.save()
+            return
+
+        try:
+            decommissioned_date = datetime.fromisoformat(decommissioned_date_str)
+            days_in_decommissioning = (datetime.now() - decommissioned_date).days
+
+            if days_in_decommissioning > config.DELETE_AFTER_DECOMMISSION_DAYS:
+                if not config.DRY_RUN:
+                    device_name = device.name
+                    device.delete()
+                    logger.warning(f"🗑️ Устройство {device_name} УДАЛЕНО физически (decommissioning {days_in_decommissioning} дней)")
+                    self.stats['deleted_hosts'].append(device_name)
+                else:
+                    logger.warning(f"[DRY RUN] Устройство {device.name} будет УДАЛЕНО физически")
+            else:
+                logger.debug(f"Устройство {device.name} в decommissioning {days_in_decommissioning}/{config.DELETE_AFTER_DECOMMISSION_DAYS} дней")
+
+        except Exception as e:
+            logger.error(f"Ошибка при проверке удаления {device.name}: {e}")
     
     def ensure_manufacturer(self, vendor_name: str) -> Optional[Any]:
         """Создание или получение производителя"""
@@ -381,6 +427,76 @@ class ServerSync:
             logger.error(f"  Ошибка работы с типом устройства {model}: {e}")
             return None
     
+    def get_or_create_device(self, host_data: Dict) -> Tuple[Any, bool]:
+        """
+        Получение или создание устройства с учетом hostid (FIX #1)
+        Returns: (device, is_new)
+        """
+        host_id = host_data['hostid']
+        host_name = host_data.get('name', 'Unknown')
+
+        # 1. Сначала ищем по zabbix_hostid (первичный ключ)
+        try:
+            devices = list(self.netbox.dcim.devices.filter(cf_zabbix_hostid=host_id))
+
+            if devices:
+                device = devices[0]
+                # Проверяем переименование
+                if device.name != host_name:
+                    logger.warning(f"  🔄 Обнаружено переименование: {device.name} → {host_name}")
+                    self.stats['renamed_hosts'].append(f"{device.name} → {host_name}")
+                    if not config.DRY_RUN:
+                        device.name = host_name
+                        device.save()
+                        logger.info(f"  ✓ Устройство переименовано в {host_name}")
+                    else:
+                        logger.info(f"  [DRY RUN] Устройство будет переименовано в {host_name}")
+                return device, False
+
+            # 2. Fallback на поиск по имени (для старых устройств без hostid)
+            device = self.netbox.dcim.devices.get(name=host_name)
+            if device:
+                # Добавляем hostid если его нет
+                if not device.custom_fields.get('zabbix_hostid'):
+                    logger.info(f"  Добавляем zabbix_hostid для существующего устройства {host_name}")
+                    if not config.DRY_RUN:
+                        device.custom_fields['zabbix_hostid'] = host_id
+                        device.save()
+                return device, False
+
+        except Exception as e:
+            logger.warning(f"  Ошибка при поиске устройства: {e}")
+
+        # 3. Устройство не найдено - будет создано новое
+        return None, True
+
+    def check_rack_position_conflict(self, rack: Any, position: int, device_id: int = None) -> Optional[Any]:
+        """
+        Проверка конфликта позиции в стойке (FIX #5)
+        Returns: Устройство которое уже занимает позицию или None
+        """
+        if not rack or not position:
+            return None
+
+        try:
+            # Ищем устройства на этой позиции
+            conflicts = list(self.netbox.dcim.devices.filter(
+                rack_id=rack.id,
+                position=position
+            ))
+
+            for conflict in conflicts:
+                # Пропускаем текущее устройство (при обновлении)
+                if device_id and conflict.id == device_id:
+                    continue
+                return conflict
+
+            return None
+
+        except Exception as e:
+            logger.error(f"  Ошибка проверки конфликта стойки: {e}")
+            return None
+
     def ensure_rack(self, rack_name: str, site: Any, location: Any = None) -> Optional[Any]:
         """Создание или получение стойки с проверкой/обновлением локации"""
         if not rack_name or not site:
@@ -465,13 +581,18 @@ class ServerSync:
             if not primary_ip:
                 logger.warning(f"  Нет валидного IP для {host_name}")
             
+            # FIX #6: Site fallback
             site_name = IPHelper.get_site_from_ip(primary_ip)
             site = self.netbox.dcim.sites.get(name=site_name)
             if not site:
-                logger.error(f"  Site {site_name} не найден в NetBox")
-                self.stats['error_hosts'].append(host_name)
-                self.stats['error_details'][host_name] = f"Site {site_name} не найден"
-                return False
+                logger.warning(f"  Site {site_name} не найден, использую {config.DEFAULT_SITE}")
+                site = self.netbox.dcim.sites.get(name=config.DEFAULT_SITE)
+
+                if not site:
+                    logger.error(f"  DEFAULT_SITE {config.DEFAULT_SITE} также не найден в NetBox!")
+                    self.stats['error_hosts'].append(host_name)
+                    self.stats['error_details'][host_name] = f"Site {site_name} и DEFAULT_SITE не найдены"
+                    return False
             
             # Локация
             location_name = config.LOCATION_MAPPING.get(site_name)
@@ -501,12 +622,29 @@ class ServerSync:
             rack_position = None
             rack_name = inventory.get('software_app_b', '')  # Используем software_app_b
             rack_unit = inventory.get('location_lon', '')
-            
+
             if rack_name:
                 rack = self.ensure_rack(rack_name, site, location)
                 if rack and rack_unit:
                     try:
                         rack_position = int(rack_unit)
+
+                        # FIX #5: Проверка конфликтов позиций в стойках
+                        if config.CHECK_RACK_CONFLICTS:
+                            conflict_device = self.check_rack_position_conflict(
+                                rack, rack_position, None  # device_id будет проверен позже
+                            )
+                            if conflict_device:
+                                logger.error(f"  ⚠️ КОНФЛИКТ: Позиция U{rack_position} в {rack.name} занята устройством {conflict_device.name}")
+                                self.stats['rack_conflicts'].append({
+                                    'device': host_name,
+                                    'rack': rack.name,
+                                    'position': rack_position,
+                                    'conflict_with': conflict_device.name
+                                })
+                                # НЕ назначаем позицию при конфликте
+                                rack = None
+                                rack_position = None
                     except ValueError:
                         logger.warning(f"  Некорректная позиция U: {rack_unit}")
             
@@ -541,17 +679,20 @@ class ServerSync:
                 'last_sync': datetime.now().isoformat()
             }
             custom_fields = {k: v for k, v in custom_fields.items() if v}
-            
-            # Проверяем существование устройства
-            device = self.netbox.dcim.devices.get(name=host_name)
-            
+
+            # FIX #1: Проверяем существование устройства по hostid
+            device, is_new = self.get_or_create_device(host_data)
+
+            # FIX #13: Status recovery - всегда обновляем статус
+            new_status = 'active' if host_data.get('status') == '0' else 'offline'
+
             # Данные устройства
             device_data = {
                 'name': host_name,
                 'device_type': device_type.id,
                 'role': device_role.id if device_role else None,
                 'site': site.id,
-                'status': 'active' if host_data.get('status') == '0' else 'offline',
+                'status': new_status,
                 'location': location.id if location else None,
                 'serial': inventory.get('serialno_a', ''),
                 'asset_tag': inventory.get('asset_tag', ''),
@@ -566,14 +707,36 @@ class ServerSync:
             
             device_data = {k: v for k, v in device_data.items() if v not in [None, '']}
             
-            if device:
-                # ИСПРАВЛЕНИЕ: Обновление существующего устройства
+            if device and not is_new:
+                # ОБНОВЛЕНИЕ существующего устройства
                 changes_made = []
-                
+
+                # FIX #13: Status recovery из decommissioning
+                if device.status == 'decommissioning' and new_status == 'active':
+                    logger.warning(f"  🔄 Устройство {host_name} восстановлено из decommissioning → active")
+                    # Очищаем дату decommissioning
+                    if device.custom_fields.get('decommissioned_date'):
+                        device.custom_fields['decommissioned_date'] = None
+                    self.stats['recovered_hosts'].append(host_name)
+
+                # FIX #4: Применяем фильтр защищенных полей
+                protected_fields = config.PROTECTED_FIELDS
+                protected_custom_fields = config.PROTECTED_CUSTOM_FIELDS
+
                 # Проверяем изменения в полях включая rack
                 for field, new_value in device_data.items():
+                    # Пропускаем protected fields
+                    if field in protected_fields:
+                        logger.debug(f"  Поле {field} защищено от перезаписи")
+                        continue
+
                     if field == 'custom_fields':
                         for cf_name, cf_value in new_value.items():
+                            # Пропускаем protected custom fields
+                            if cf_name in protected_custom_fields:
+                                logger.debug(f"  Custom field {cf_name} защищено от перезаписи")
+                                continue
+
                             old_cf_value = device.custom_fields.get(cf_name)
                             if str(old_cf_value) != str(cf_value):
                                 changes_made.append(f"{cf_name}: {old_cf_value} → {cf_value}")
@@ -716,13 +879,13 @@ class ServerSync:
             return None
     
     def sync_ip_address(self, ip: str, device: Any) -> Tuple[Optional[Any], Optional[Any]]:
-        """Синхронизация IP адреса и интерфейса"""
+        """Синхронизация IP адреса и интерфейса с очисткой orphaned IP (FIX #3)"""
         if not ip or not DataValidator.validate_ip(ip):
             return None, None
-        
+
         interface = None
         ip_address = None
-        
+
         try:
             # Создаем/получаем интерфейс
             interface_name = "mgmt0"
@@ -730,7 +893,7 @@ class ServerSync:
                 device_id=device.id,
                 name=interface_name
             )
-            
+
             if not interface:
                 if not config.DRY_RUN:
                     interface = self.netbox.dcim.interfaces.create(
@@ -744,9 +907,35 @@ class ServerSync:
                 else:
                     logger.info(f"    [DRY RUN] Будет создан интерфейс {interface_name}")
                     return None, None
-            
-            # Работаем с IP
+
+            # FIX #3: Проверяем старый primary IP
             ip_with_mask = f"{ip}/32"
+            old_primary_ip = device.primary_ip4
+
+            if old_primary_ip and old_primary_ip.address != ip_with_mask:
+                logger.info(f"    🔄 Обнаружено изменение IP: {old_primary_ip.address} → {ip_with_mask}")
+                if not config.DRY_RUN:
+                    # Освобождаем старый IP
+                    try:
+                        old_ip_obj = self.netbox.ipam.ip_addresses.get(id=old_primary_ip.id)
+                        if old_ip_obj:
+                            # Действие зависит от конфигурации
+                            if config.ORPHANED_IP_ACTION == 'delete':
+                                old_ip_obj.delete()
+                                logger.info(f"    Старый IP {old_primary_ip.address} удален")
+                            elif config.ORPHANED_IP_ACTION == 'deprecated':
+                                old_ip_obj.assigned_object_type = None
+                                old_ip_obj.assigned_object_id = None
+                                old_ip_obj.status = 'deprecated'
+                                old_ip_obj.description = f"Deprecated: was used by {device.name}"
+                                old_ip_obj.save()
+                                logger.info(f"    Старый IP {old_primary_ip.address} помечен deprecated")
+                            else:  # keep
+                                logger.info(f"    Старый IP {old_primary_ip.address} оставлен как есть")
+                    except Exception as e:
+                        logger.warning(f"    Ошибка при освобождении старого IP: {e}")
+
+            # Работаем с новым IP
             ip_address = self.netbox.ipam.ip_addresses.get(address=ip_with_mask)
             
             if ip_address:
@@ -754,6 +943,9 @@ class ServerSync:
                     if not config.DRY_RUN:
                         ip_address.assigned_object_type = 'dcim.interface'
                         ip_address.assigned_object_id = interface.id
+                        # Восстанавливаем status если был deprecated
+                        if ip_address.status == 'deprecated':
+                            ip_address.status = 'active'
                         ip_address.save()
                         logger.info(f"    IP {ip} привязан к интерфейсу")
             else:
@@ -863,13 +1055,35 @@ class ServerSync:
         logger.info(f"  ✓ Успешно: {success_count}")
         logger.info(f"  ✗ Ошибок: {error_count}")
         logger.info(f"  ⏭ Пропущено: {len(self.stats['skipped_hosts'])}")
+
+        # Новые категории
+        if self.stats['renamed_hosts']:
+            logger.info(f"  🔄 Переименовано: {len(self.stats['renamed_hosts'])}")
+            for rename in self.stats['renamed_hosts'][:3]:
+                logger.info(f"      • {rename}")
+            if len(self.stats['renamed_hosts']) > 3:
+                logger.info(f"      ... и еще {len(self.stats['renamed_hosts']) - 3}")
+
+        if self.stats['recovered_hosts']:
+            logger.info(f"  ↩️ Восстановлено из decommissioning: {len(self.stats['recovered_hosts'])}")
+
         logger.info(f"  🗑 Decommissioned: {len(self.stats['decommissioned_hosts'])}")
-        
+
+        if self.stats['deleted_hosts']:
+            logger.warning(f"  ❌ Физически удалено: {len(self.stats['deleted_hosts'])}")
+            for deleted in self.stats['deleted_hosts'][:3]:
+                logger.warning(f"      • {deleted}")
+
+        if self.stats['rack_conflicts']:
+            logger.warning(f"\n⚠️ Конфликты позиций в стойках: {len(self.stats['rack_conflicts'])}")
+            for conflict in self.stats['rack_conflicts'][:3]:
+                logger.warning(f"  • {conflict['device']}: U{conflict['position']} в {conflict['rack']} занята {conflict['conflict_with']}")
+
         if self.stats['new_models']:
             logger.warning(f"\n⚠️ Новые модели без U-height:")
             for model in self.stats['new_models']:
                 logger.warning(f"  • {model}")
-        
+
         logger.info("=" * 60)
         
         return self.stats
