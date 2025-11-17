@@ -136,44 +136,99 @@ class ServerSync:
                 selectInterfaces=['ip', 'type', 'main'],
                 selectGroups=['groupid', 'name']
             )
-            
+
+            logger.info(f"📊 Получено {len(hosts)} хостов из Zabbix (до фильтрации)")
+
+            # Паттерны для исключения сетевого оборудования по имени
+            NETWORK_DEVICE_PATTERNS = [
+                r'-sw\d',      # switches: leaf-sw01, edge-sw02, etc.
+                r'-sw-',       # switches: mgmt-ac-sw01-alm
+                r'-rt\d',      # routers: edge-rt01, col-edge-rt02
+                r'-fw\d',      # firewalls: edge-fw01, cloud-edge-fw02
+                r'leaf-',      # leaf switches
+                r'spine-',     # spine switches
+                r'edge-',      # edge devices
+                r'mgmt-ac-',   # management access switches
+                r'mgmt-ag-',   # management aggregation switches
+                r'col-edge',   # colocation edge
+                r'cloud-edge', # cloud edge
+                r'cloud-leaf', # cloud leaf
+                r'cloud-spine',# cloud spine
+                r'\d+sw$',     # ends with sw: 5900sw
+            ]
+
             # Фильтрация
             filtered_hosts = []
+            excluded_count = {'template': 0, 'group': 0, 'network_device': 0, 'no_template': 0}
+
             for host in hosts:
+                host_name = host.get('host', host.get('name', 'Unknown'))
                 templates = [t.get('name', '') for t in host.get('parentTemplates', [])]
                 groups = [g.get('name', '') for g in host.get('groups', [])]
-                
-                # Проверка включенных шаблонов
+
+                # 1. Исключить сетевое оборудование по имени (ПРИОРИТЕТ!)
+                is_network_device = any(re.search(pattern, host_name, re.IGNORECASE) for pattern in NETWORK_DEVICE_PATTERNS)
+                if is_network_device:
+                    logger.debug(f"❌ {host_name}: сетевое оборудование (паттерн имени)")
+                    excluded_count['network_device'] += 1
+                    continue
+
+                # 2. Проверка включенных шаблонов (точное совпадение)
                 has_included = any(
-                    incl in template 
-                    for template in templates 
+                    incl.lower() == template.lower()
+                    for template in templates
                     for incl in config.INCLUDED_TEMPLATES
                 )
-                
-                # Проверка исключенных
+
+                if not has_included:
+                    logger.debug(f"❌ {host_name}: нет шаблона VMware Hypervisor. Шаблоны: {', '.join(templates) if templates else 'нет'}")
+                    excluded_count['no_template'] += 1
+                    continue
+
+                # 3. Проверка исключенных шаблонов
                 has_excluded = any(
-                    excl in template 
-                    for template in templates 
+                    excl.lower() in template.lower()
+                    for template in templates
                     for excl in config.EXCLUDED_TEMPLATES
                 )
-                
+
+                if has_excluded:
+                    logger.debug(f"❌ {host_name}: исключенный шаблон. Шаблоны: {', '.join(templates)}")
+                    excluded_count['template'] += 1
+                    continue
+
+                # 4. Проверка исключенных групп
                 has_excluded_group = any(
-                    excl in group 
-                    for group in groups 
+                    excl.lower() in group.lower()
+                    for group in groups
                     for excl in config.EXCLUDED_GROUPS
                 )
-                
-                if has_included and not has_excluded and not has_excluded_group:
-                    filtered_hosts.append(host)
-            
+
+                if has_excluded_group:
+                    logger.debug(f"❌ {host_name}: исключенная группа. Группы: {', '.join(groups)}")
+                    excluded_count['group'] += 1
+                    continue
+
+                # Хост прошел все проверки
+                logger.debug(f"✅ {host_name}: VMware Hypervisor хост")
+                filtered_hosts.append(host)
+
+            # Логирование статистики фильтрации
+            logger.info(f"📋 Статистика фильтрации:")
+            logger.info(f"  • Всего из Zabbix: {len(hosts)}")
+            logger.info(f"  • Сетевое оборудование (исключено по имени): {excluded_count['network_device']}")
+            logger.info(f"  • Без шаблона VMware Hypervisor: {excluded_count['no_template']}")
+            logger.info(f"  • Исключено по шаблону: {excluded_count['template']}")
+            logger.info(f"  • Исключено по группе: {excluded_count['group']}")
+            logger.info(f"  ✓ Итого для синхронизации: {len(filtered_hosts)}")
+
             # Применяем лимит если задан
             if config.HOST_LIMIT:
                 filtered_hosts = filtered_hosts[:config.HOST_LIMIT]
                 logger.info(f"Применен лимит: {config.HOST_LIMIT} хостов")
-            
-            logger.info(f"Найдено {len(filtered_hosts)} хостов для синхронизации")
+
             return filtered_hosts
-            
+
         except Exception as e:
             logger.error(f"Ошибка получения хостов из Zabbix: {e}")
             return []
