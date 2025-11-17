@@ -287,21 +287,52 @@ class ServerSync:
             return
 
         try:
-            # Получаем все активные хосты из Zabbix
+            # Паттерны сетевого оборудования (должны совпадать с get_vmware_hosts)
+            NETWORK_DEVICE_PATTERNS = [
+                r'-sw\d', r'-sw-', r'-rt\d', r'-fw\d',
+                r'leaf-', r'spine-', r'edge-', r'mgmt-ac-', r'mgmt-ag-',
+                r'col-edge', r'cloud-edge', r'cloud-leaf', r'cloud-spine',
+                r'\d+sw$'
+            ]
+
+            # Получаем все активные хосты из Zabbix (ТОЛЬКО СЕРВЕРЫ)
             active_host_ids = set()
             for host in self.get_vmware_hosts():
                 active_host_ids.add(host['hostid'])
 
+            logger.debug(f"Активных серверных хостов в Zabbix: {len(active_host_ids)}")
+
             # 1. Проверяем активные устройства для decommissioning
+            # ВАЖНО: Получаем ВСЕ устройства с zabbix_hostid
             netbox_devices = self.netbox.dcim.devices.filter(
                 cf_zabbix_hostid__n=False,  # Не null
                 status='active'
             )
 
+            excluded_network_count = 0
+            checked_count = 0
+
             for device in netbox_devices:
+                device_name = device.name
+
+                # ФИЛЬТР: Пропускаем сетевое оборудование
+                is_network_device = any(
+                    re.search(pattern, device_name, re.IGNORECASE)
+                    for pattern in NETWORK_DEVICE_PATTERNS
+                )
+
+                if is_network_device:
+                    logger.debug(f"⏭ Пропуск сетевого устройства: {device_name}")
+                    excluded_network_count += 1
+                    continue
+
+                # Проверяем только серверные устройства
                 zabbix_hostid = device.custom_fields.get('zabbix_hostid')
                 if zabbix_hostid and zabbix_hostid not in active_host_ids:
                     self._mark_as_decommissioning(device, zabbix_hostid)
+                    checked_count += 1
+
+            logger.info(f"📊 Проверка decommissioning: исключено {excluded_network_count} сетевых устройств, проверено {checked_count} серверов")
 
             # 2. FIX #2: Проверяем устройства в decommissioning для физического удаления
             if config.ENABLE_PHYSICAL_DELETION:
@@ -310,6 +341,16 @@ class ServerSync:
                 )
 
                 for device in decommissioning_devices:
+                    # ФИЛЬТР: Пропускаем сетевое оборудование
+                    is_network_device = any(
+                        re.search(pattern, device.name, re.IGNORECASE)
+                        for pattern in NETWORK_DEVICE_PATTERNS
+                    )
+
+                    if is_network_device:
+                        logger.debug(f"⏭ Пропуск сетевого устройства при проверке удаления: {device.name}")
+                        continue
+
                     self._check_for_deletion(device)
 
             # Обновляем last_seen для активных хостов
