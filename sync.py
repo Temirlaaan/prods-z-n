@@ -297,10 +297,13 @@ class ServerSync:
 
             # Получаем все активные хосты из Zabbix (ТОЛЬКО СЕРВЕРЫ)
             active_host_ids = set()
+            active_host_names = {}  # hostid -> name для логирования
+
             for host in self.get_vmware_hosts():
                 active_host_ids.add(host['hostid'])
+                active_host_names[host['hostid']] = host.get('name', host.get('host', 'Unknown'))
 
-            logger.debug(f"Активных серверных хостов в Zabbix: {len(active_host_ids)}")
+            logger.info(f"📊 Активных серверных хостов в Zabbix: {len(active_host_ids)}")
 
             # 1. Проверяем активные устройства для decommissioning
             # ВАЖНО: Получаем ВСЕ устройства с zabbix_hostid
@@ -310,7 +313,8 @@ class ServerSync:
             )
 
             excluded_network_count = 0
-            checked_count = 0
+            checked_servers_count = 0
+            missing_devices = []  # Устройства которых нет в Zabbix
 
             for device in netbox_devices:
                 device_name = device.name
@@ -327,12 +331,32 @@ class ServerSync:
                     continue
 
                 # Проверяем только серверные устройства
+                checked_servers_count += 1
                 zabbix_hostid = device.custom_fields.get('zabbix_hostid')
-                if zabbix_hostid and zabbix_hostid not in active_host_ids:
-                    self._mark_as_decommissioning(device, zabbix_hostid)
-                    checked_count += 1
 
-            logger.info(f"📊 Проверка decommissioning: исключено {excluded_network_count} сетевых устройств, проверено {checked_count} серверов")
+                if zabbix_hostid and zabbix_hostid not in active_host_ids:
+                    # Устройство есть в NetBox, но нет в Zabbix
+                    missing_devices.append({
+                        'name': device_name,
+                        'hostid': zabbix_hostid
+                    })
+                    self._mark_as_decommissioning(device, zabbix_hostid)
+
+            # Логирование результатов проверки
+            logger.info(f"📊 Проверка decommissioning:")
+            logger.info(f"  • Серверов в Zabbix (активных): {len(active_host_ids)}")
+            logger.info(f"  • Серверов в NetBox (active): {checked_servers_count}")
+            logger.info(f"  • Сетевых устройств (пропущено): {excluded_network_count}")
+
+            if missing_devices:
+                logger.warning(f"  ⚠️ Устройств отсутствует в Zabbix: {len(missing_devices)}")
+                logger.warning(f"  Список пропавших устройств:")
+                for dev in missing_devices[:10]:  # Показываем первые 10
+                    logger.warning(f"    • {dev['name']} (zabbix_hostid: {dev['hostid']})")
+                if len(missing_devices) > 10:
+                    logger.warning(f"    ... и еще {len(missing_devices) - 10} устройств")
+            else:
+                logger.info(f"  ✅ Все серверные устройства присутствуют в Zabbix")
 
             # 2. FIX #2: Проверяем устройства в decommissioning для физического удаления
             if config.ENABLE_PHYSICAL_DELETION:
@@ -373,16 +397,18 @@ class ServerSync:
             if days_inactive > config.DECOMMISSION_AFTER_DAYS:
                 if not config.DRY_RUN:
                     device.status = 'decommissioning'
-                    # Добавляем дату decommissioning
-                    device.custom_fields['decommissioned_date'] = datetime.now().isoformat()
+                    # КРИТИЧНО: Используем date().isoformat() вместо datetime.isoformat()
+                    # NetBox custom field типа 'date' требует формат YYYY-MM-DD, а не YYYY-MM-DDTHH:MM:SS
+                    device.custom_fields['decommissioned_date'] = datetime.now().date().isoformat()
                     device.save()
-                    logger.info(f"Устройство {device.name} помечено как decommissioning (неактивно {days_inactive} дней)")
+                    logger.warning(f"⚠️ Устройство {device.name} помечено как decommissioning (неактивно {days_inactive} дней)")
                 else:
-                    logger.info(f"[DRY RUN] Устройство {device.name} будет помечено как decommissioning")
+                    logger.info(f"[DRY RUN] Устройство {device.name} будет помечено как decommissioning (неактивно {days_inactive} дней)")
 
                 self.stats['decommissioned_hosts'].append(device.name)
         else:
             # Первый раз не видим - записываем дату
+            logger.debug(f"Первое обнаружение отсутствия устройства {device.name} в Zabbix, записываем last_seen")
             self.redis_client.set(last_seen_key, datetime.now().isoformat())
 
     def _check_for_deletion(self, device: Any):
@@ -392,22 +418,26 @@ class ServerSync:
         if not decommissioned_date_str:
             # Если даты нет, устанавливаем сейчас
             if not config.DRY_RUN:
-                device.custom_fields['decommissioned_date'] = datetime.now().isoformat()
+                # КРИТИЧНО: Используем date().isoformat() для формата YYYY-MM-DD
+                device.custom_fields['decommissioned_date'] = datetime.now().date().isoformat()
                 device.save()
+                logger.info(f"Установлена дата decommissioning для {device.name}")
             return
 
         try:
-            decommissioned_date = datetime.fromisoformat(decommissioned_date_str)
-            days_in_decommissioning = (datetime.now() - decommissioned_date).days
+            # Парсим дату в формате YYYY-MM-DD
+            from datetime import date
+            decommissioned_date = date.fromisoformat(decommissioned_date_str)
+            days_in_decommissioning = (datetime.now().date() - decommissioned_date).days
 
             if days_in_decommissioning > config.DELETE_AFTER_DECOMMISSION_DAYS:
                 if not config.DRY_RUN:
                     device_name = device.name
                     device.delete()
-                    logger.warning(f"🗑️ Устройство {device_name} УДАЛЕНО физически (decommissioning {days_in_decommissioning} дней)")
+                    logger.warning(f"🗑️ Устройство {device_name} УДАЛЕНО физически (в decommissioning {days_in_decommissioning} дней)")
                     self.stats['deleted_hosts'].append(device_name)
                 else:
-                    logger.warning(f"[DRY RUN] Устройство {device.name} будет УДАЛЕНО физически")
+                    logger.warning(f"[DRY RUN] Устройство {device.name} будет УДАЛЕНО физически (в decommissioning {days_in_decommissioning} дней)")
             else:
                 logger.debug(f"Устройство {device.name} в decommissioning {days_in_decommissioning}/{config.DELETE_AFTER_DECOMMISSION_DAYS} дней")
 
