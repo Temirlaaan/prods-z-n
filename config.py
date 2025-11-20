@@ -114,6 +114,7 @@ CUSTOM_FIELDS = [
     'rack_name',        # Имя стойки из Zabbix
     'rack_unit',        # Позиция U в стойке
     'decommissioned_date',  # НОВОЕ: Дата decommissioning
+    'sync_source',      # НОВОЕ: Источник синхронизации (prods-z-n, prods-z-n-network)
 ]
 
 # === МАППИНГ ПОЛЕЙ ZABBIX → NETBOX ===
@@ -157,6 +158,14 @@ EXCLUDED_GROUPS = [
 INCLUDED_TEMPLATES = [
     'VMware Hypervisor'
 ]
+
+# === НАСТРОЙКИ РАЗДЕЛЕНИЯ УСТРОЙСТВ ===
+# Идентификатор источника синхронизации (для разделения с prods-z-n-network)
+SYNC_SOURCE = os.getenv('SYNC_SOURCE', 'prods-z-n')
+
+# Роли устройств, которыми управляет этот проект (для decommission)
+MANAGED_DEVICE_ROLES_STR = os.getenv('MANAGED_DEVICE_ROLES', 'Server')
+MANAGED_DEVICE_ROLES = [role.strip() for role in MANAGED_DEVICE_ROLES_STR.split(',') if role.strip()]
 
 # === НАСТРОЙКИ УДАЛЕНИЯ ===
 # Через сколько дней неактивности помечать устройство как decommissioned
