@@ -237,34 +237,25 @@ class ServerSync:
             for host in self.get_vmware_hosts():
                 active_host_ids.add(host['hostid'])
 
-            # FIX: Фильтруем только устройства, управляемые этим проектом
-            # 1. Проверяем активные устройства для decommissioning
-            filter_params = {
-                'cf_zabbix_hostid__n': False,  # Не null
-                'status': 'active'
-            }
-
-            # Добавляем фильтр по sync_source если настроен
-            if config.SYNC_SOURCE:
-                filter_params['cf_sync_source'] = config.SYNC_SOURCE
-
-            netbox_devices = self.netbox.dcim.devices.filter(**filter_params)
-
-            # Дополнительная фильтрация по ролям (если sync_source не установлен)
-            if not config.SYNC_SOURCE and config.MANAGED_DEVICE_ROLES:
-                # Получаем ID ролей
-                role_ids = []
+            # FIX: Фильтруем только устройства с ролью Server
+            # Получаем ID ролей, которыми управляет этот проект
+            role_ids = []
+            if config.MANAGED_DEVICE_ROLES:
                 for role_name in config.MANAGED_DEVICE_ROLES:
                     role = self.netbox.dcim.device_roles.get(name=role_name)
                     if role:
                         role_ids.append(role.id)
+                logger.info(f"Проверка decommission для ролей: {config.MANAGED_DEVICE_ROLES}")
 
-                # Фильтруем устройства по ролям
-                if role_ids:
-                    netbox_devices = [d for d in netbox_devices if d.role and d.role.id in role_ids]
-                    logger.info(f"Фильтрация decommission по ролям: {config.MANAGED_DEVICE_ROLES}")
-            else:
-                logger.info(f"Фильтрация decommission по sync_source: {config.SYNC_SOURCE}")
+            # 1. Проверяем активные устройства для decommissioning
+            netbox_devices = self.netbox.dcim.devices.filter(
+                cf_zabbix_hostid__n=False,  # Не null
+                status='active'
+            )
+
+            # Фильтруем по ролям - проверяем только серверы
+            if role_ids:
+                netbox_devices = [d for d in netbox_devices if d.role and d.role.id in role_ids]
 
             for device in netbox_devices:
                 zabbix_hostid = device.custom_fields.get('zabbix_hostid')
@@ -273,18 +264,11 @@ class ServerSync:
 
             # 2. FIX #2: Проверяем устройства в decommissioning для физического удаления
             if config.ENABLE_PHYSICAL_DELETION:
-                # FIX: Фильтруем только устройства, управляемые этим проектом
-                delete_filter_params = {'status': 'decommissioning'}
+                decommissioning_devices = self.netbox.dcim.devices.filter(status='decommissioning')
 
-                if config.SYNC_SOURCE:
-                    delete_filter_params['cf_sync_source'] = config.SYNC_SOURCE
-
-                decommissioning_devices = self.netbox.dcim.devices.filter(**delete_filter_params)
-
-                # Дополнительная фильтрация по ролям (если sync_source не установлен)
-                if not config.SYNC_SOURCE and config.MANAGED_DEVICE_ROLES:
-                    if role_ids:  # используем role_ids из предыдущего блока
-                        decommissioning_devices = [d for d in decommissioning_devices if d.role and d.role.id in role_ids]
+                # Фильтруем по ролям - удаляем только серверы
+                if role_ids:
+                    decommissioning_devices = [d for d in decommissioning_devices if d.role and d.role.id in role_ids]
 
                 for device in decommissioning_devices:
                     self._check_for_deletion(device)
@@ -708,8 +692,7 @@ class ServerSync:
                 'asset_tag': inventory.get('asset_tag', ''),
                 'rack_name': rack_name,
                 'rack_unit': rack_unit,
-                'last_sync': datetime.now().date().isoformat(),
-                'sync_source': config.SYNC_SOURCE  # FIX: Маркируем источник синхронизации
+                'last_sync': datetime.now().date().isoformat()
             }
             custom_fields = {k: v for k, v in custom_fields.items() if v}
 
