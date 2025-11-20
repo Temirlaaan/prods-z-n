@@ -158,6 +158,13 @@ INCLUDED_TEMPLATES = [
     'VMware Hypervisor'
 ]
 
+# === НАСТРОЙКИ РАЗДЕЛЕНИЯ УСТРОЙСТВ ===
+# Роли устройств, которыми управляет этот проект (для decommission)
+# Этот проект управляет только серверами - при проверке decommission будут
+# проверяться только устройства с этими ролями
+MANAGED_DEVICE_ROLES_STR = os.getenv('MANAGED_DEVICE_ROLES', 'Server')
+MANAGED_DEVICE_ROLES = [role.strip() for role in MANAGED_DEVICE_ROLES_STR.split(',') if role.strip()]
+
 # === НАСТРОЙКИ УДАЛЕНИЯ ===
 # Через сколько дней неактивности помечать устройство как decommissioned
 DECOMMISSION_AFTER_DAYS = int(os.getenv('DECOMMISSION_AFTER_DAYS', '30'))

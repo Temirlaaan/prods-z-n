@@ -237,11 +237,25 @@ class ServerSync:
             for host in self.get_vmware_hosts():
                 active_host_ids.add(host['hostid'])
 
+            # FIX: Фильтруем только устройства с ролью Server
+            # Получаем ID ролей, которыми управляет этот проект
+            role_ids = []
+            if config.MANAGED_DEVICE_ROLES:
+                for role_name in config.MANAGED_DEVICE_ROLES:
+                    role = self.netbox.dcim.device_roles.get(name=role_name)
+                    if role:
+                        role_ids.append(role.id)
+                logger.info(f"Проверка decommission для ролей: {config.MANAGED_DEVICE_ROLES}")
+
             # 1. Проверяем активные устройства для decommissioning
             netbox_devices = self.netbox.dcim.devices.filter(
                 cf_zabbix_hostid__n=False,  # Не null
                 status='active'
             )
+
+            # Фильтруем по ролям - проверяем только серверы
+            if role_ids:
+                netbox_devices = [d for d in netbox_devices if d.role and d.role.id in role_ids]
 
             for device in netbox_devices:
                 zabbix_hostid = device.custom_fields.get('zabbix_hostid')
@@ -250,9 +264,11 @@ class ServerSync:
 
             # 2. FIX #2: Проверяем устройства в decommissioning для физического удаления
             if config.ENABLE_PHYSICAL_DELETION:
-                decommissioning_devices = self.netbox.dcim.devices.filter(
-                    status='decommissioning'
-                )
+                decommissioning_devices = self.netbox.dcim.devices.filter(status='decommissioning')
+
+                # Фильтруем по ролям - удаляем только серверы
+                if role_ids:
+                    decommissioning_devices = [d for d in decommissioning_devices if d.role and d.role.id in role_ids]
 
                 for device in decommissioning_devices:
                     self._check_for_deletion(device)
