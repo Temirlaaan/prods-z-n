@@ -260,7 +260,7 @@ class ServerSync:
             # Обновляем last_seen для активных хостов
             for host_id in active_host_ids:
                 last_seen_key = f"{config.REDIS_KEY_PREFIX}lastseen:{host_id}"
-                self.redis_client.set(last_seen_key, datetime.now().isoformat())
+                self.redis_client.set(last_seen_key, datetime.now().date().isoformat())
 
         except Exception as e:
             logger.error(f"Ошибка при проверке decommissioned устройств: {e}")
@@ -278,7 +278,7 @@ class ServerSync:
                 if not config.DRY_RUN:
                     device.status = 'decommissioning'
                     # Добавляем дату decommissioning
-                    device.custom_fields['decommissioned_date'] = datetime.now().isoformat()
+                    device.custom_fields['decommissioned_date'] = datetime.now().date().isoformat()
                     device.save()
                     logger.info(f"Устройство {device.name} помечено как decommissioning (неактивно {days_inactive} дней)")
                 else:
@@ -287,7 +287,7 @@ class ServerSync:
                 self.stats['decommissioned_hosts'].append(device.name)
         else:
             # Первый раз не видим - записываем дату
-            self.redis_client.set(last_seen_key, datetime.now().isoformat())
+            self.redis_client.set(last_seen_key, datetime.now().date().isoformat())
 
     def _check_for_deletion(self, device: Any):
         """Проверить и удалить устройство если прошло достаточно времени (FIX #2)"""
@@ -296,7 +296,7 @@ class ServerSync:
         if not decommissioned_date_str:
             # Если даты нет, устанавливаем сейчас
             if not config.DRY_RUN:
-                device.custom_fields['decommissioned_date'] = datetime.now().isoformat()
+                device.custom_fields['decommissioned_date'] = datetime.now().date().isoformat()
                 device.save()
             return
 
@@ -676,7 +676,7 @@ class ServerSync:
                 'asset_tag': inventory.get('asset_tag', ''),
                 'rack_name': rack_name,
                 'rack_unit': rack_unit,
-                'last_sync': datetime.now().isoformat()
+                'last_sync': datetime.now().date().isoformat()
             }
             custom_fields = {k: v for k, v in custom_fields.items() if v}
 
