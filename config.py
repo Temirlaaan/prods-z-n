@@ -68,31 +68,49 @@ LOCATION_MAPPING = {
 
 # Vendor + Model → U-Height
 U_HEIGHT_MAPPING = {
+    # === Dell (rack servers) ===
     'Dell Inc. PowerEdge R640': 1,
     'Dell Inc. PowerEdge R740': 2,
     'Dell PowerEdge R640': 1,
     'Dell PowerEdge R740': 2,
+
+    # === HPE (rack servers) ===
     'HPE ProLiant DL360 Gen10': 1,
     'HPE ProLiant DL380 Gen10': 2,
-    'Huawei CH121 V3': 1,
+
+    # === Huawei (rack servers) ===
     'Huawei RH1288 V3': 1,
     'Huawei RH2288H V3': 2,
     'Huawei RH5885H V3': 4,
     'Huawei Technologies Co., Ltd. RH5885H V3': 4,
     'Huawei Technologies Co., Ltd. To be filled by O.E.M.': 4,
+    'Huawei To be filled by O.E.M.': 2,
+
+    # === Huawei (blade servers - 0U, goes into chassis) ===
+    'Huawei CH121 V3': 0,
+
+    # === Lenovo (rack servers) ===
     'Lenovo J900XBXR': 1,
     'Lenovo ThinkAgile VX7531 Node': 2,
     'Lenovo ThinkSystem SR645': 1,
     'Lenovo ThinkSystem SR650': 2,
-    'VMware Virtual Platform': 0,  # Виртуальная машина
-    
-    # Добавляем маппинги для Unknown моделей
+
+    # === Cisco (blade servers - 0U, goes into chassis) ===
+    'Cisco Systems Inc UCSB-B200-M4': 0,
+    'Cisco UCSB-B200-M4': 0,
+
+    # === VMware (virtual - 0U) ===
+    'VMware Virtual Platform': 0,
+
+    # === Fallback/Generic ===
     'Dell Unknown': 2,
     'HPE Unknown': 2,
     'Huawei Unknown': 2,
     'Lenovo Unknown': 2,
+    'Cisco Unknown': 2,
     'Unknown Unknown': 2,
-    'Generic Server': 2
+    'Generic Server': 2,
+    'Generic Unknown': 2
 }
 
 # Default Site если не определен по IP
