@@ -233,6 +233,18 @@ CHASSIS_DEVICES = [
 ]
 
 
+class FakeObject:
+    """Фиктивный объект для dry-run режима"""
+    _id_counter = 9000
+
+    def __init__(self, name, **kwargs):
+        FakeObject._id_counter += 1
+        self.id = FakeObject._id_counter
+        self.name = name
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
 class NetBoxInitializer:
     """Класс для инициализации NetBox"""
 
@@ -251,6 +263,8 @@ class NetBoxInitializer:
         }
         self.manufacturers_cache = {}
         self.device_types_cache = {}
+        self.sites_cache = {}
+        self.roles_cache = {}
 
     def connect(self):
         """Подключение к NetBox"""
@@ -280,11 +294,15 @@ class NetBoxInitializer:
                 if existing:
                     print(f"  [SKIP] {site_data['name']} - уже существует")
                     self.stats['sites']['skipped'] += 1
+                    self.sites_cache[site_data['name']] = existing
                 else:
                     if not self.dry_run:
-                        self.nb.dcim.sites.create(**site_data)
+                        new_site = self.nb.dcim.sites.create(**site_data)
+                        self.sites_cache[site_data['name']] = new_site
                         print(f"  [OK] {site_data['name']} - создан")
                     else:
+                        # В dry-run создаем фиктивный объект для зависимостей
+                        self.sites_cache[site_data['name']] = FakeObject(site_data['name'], slug=site_data['slug'])
                         print(f"  [DRY] {site_data['name']} - будет создан")
                     self.stats['sites']['created'] += 1
 
@@ -310,6 +328,8 @@ class NetBoxInitializer:
                         self.manufacturers_cache[mfr_data['name']] = new_mfr
                         print(f"  [OK] {mfr_data['name']} - создан")
                     else:
+                        # В dry-run создаем фиктивный объект для зависимостей
+                        self.manufacturers_cache[mfr_data['name']] = FakeObject(mfr_data['name'], slug=mfr_data['slug'])
                         print(f"  [DRY] {mfr_data['name']} - будет создан")
                     self.stats['manufacturers']['created'] += 1
 
@@ -328,11 +348,15 @@ class NetBoxInitializer:
                 if existing:
                     print(f"  [SKIP] {role_data['name']} - уже существует")
                     self.stats['device_roles']['skipped'] += 1
+                    self.roles_cache[role_data['name']] = existing
                 else:
                     if not self.dry_run:
-                        self.nb.dcim.device_roles.create(**role_data)
+                        new_role = self.nb.dcim.device_roles.create(**role_data)
+                        self.roles_cache[role_data['name']] = new_role
                         print(f"  [OK] {role_data['name']} - создан")
                     else:
+                        # В dry-run создаем фиктивный объект для зависимостей
+                        self.roles_cache[role_data['name']] = FakeObject(role_data['name'], slug=role_data['slug'])
                         print(f"  [DRY] {role_data['name']} - будет создан")
                     self.stats['device_roles']['created'] += 1
 
@@ -345,10 +369,11 @@ class NetBoxInitializer:
         print("\n[4/8] DEVICE TYPES")
 
         for dt_data in DEVICE_TYPES:
+            mfr_name = dt_data.get('manufacturer')
             try:
                 mfr_name = dt_data.pop('manufacturer')
 
-                # Получаем manufacturer
+                # Получаем manufacturer из кэша (включая фиктивные объекты в dry-run)
                 manufacturer = self.manufacturers_cache.get(mfr_name)
                 if not manufacturer:
                     manufacturer = self.nb.dcim.manufacturers.get(name=mfr_name)
@@ -361,41 +386,57 @@ class NetBoxInitializer:
                     dt_data['manufacturer'] = mfr_name  # Восстанавливаем
                     continue
 
-                # Проверяем существование
-                existing = self.nb.dcim.device_types.get(
-                    model=dt_data['model'],
-                    manufacturer_id=manufacturer.id
-                )
+                # Определяем тип устройства для вывода
+                device_info = f"{mfr_name} {dt_data['model']} ({dt_data['u_height']}U"
+                if dt_data.get('subdevice_role') == 'parent':
+                    device_info += ", parent"
+                elif dt_data.get('subdevice_role') == 'child':
+                    device_info += ", child"
+                device_info += ")"
 
-                if existing:
-                    print(f"  [SKIP] {mfr_name} {dt_data['model']} - уже существует")
-                    self.stats['device_types']['skipped'] += 1
-                    self.device_types_cache[dt_data['slug']] = existing
-                else:
-                    dt_data['manufacturer'] = manufacturer.id
-
-                    # Определяем тип устройства для вывода
-                    device_info = f"{mfr_name} {dt_data['model']} ({dt_data['u_height']}U"
-                    if dt_data.get('subdevice_role') == 'parent':
-                        device_info += ", parent"
-                    elif dt_data.get('subdevice_role') == 'child':
-                        device_info += ", child"
-                    device_info += ")"
-
-                    if not self.dry_run:
-                        new_dt = self.nb.dcim.device_types.create(**dt_data)
-                        self.device_types_cache[dt_data['slug']] = new_dt
-                        print(f"  [OK] {device_info} - создан")
-                    else:
-                        print(f"  [DRY] {device_info} - будет создан")
+                # В dry-run режиме не проверяем существование если manufacturer фиктивный
+                if self.dry_run and isinstance(manufacturer, FakeObject):
+                    self.device_types_cache[dt_data['slug']] = FakeObject(
+                        dt_data['model'],
+                        slug=dt_data['slug'],
+                        u_height=dt_data['u_height']
+                    )
+                    print(f"  [DRY] {device_info} - будет создан")
                     self.stats['device_types']['created'] += 1
+                else:
+                    # Проверяем существование в реальном NetBox
+                    existing = self.nb.dcim.device_types.get(
+                        model=dt_data['model'],
+                        manufacturer_id=manufacturer.id
+                    )
+
+                    if existing:
+                        print(f"  [SKIP] {mfr_name} {dt_data['model']} - уже существует")
+                        self.stats['device_types']['skipped'] += 1
+                        self.device_types_cache[dt_data['slug']] = existing
+                    else:
+                        dt_data['manufacturer'] = manufacturer.id
+
+                        if not self.dry_run:
+                            new_dt = self.nb.dcim.device_types.create(**dt_data)
+                            self.device_types_cache[dt_data['slug']] = new_dt
+                            print(f"  [OK] {device_info} - создан")
+                        else:
+                            self.device_types_cache[dt_data['slug']] = FakeObject(
+                                dt_data['model'],
+                                slug=dt_data['slug'],
+                                u_height=dt_data['u_height']
+                            )
+                            print(f"  [DRY] {device_info} - будет создан")
+                        self.stats['device_types']['created'] += 1
 
                 dt_data['manufacturer'] = mfr_name  # Восстанавливаем для следующих итераций
 
             except Exception as e:
                 print(f"  [ERR] {dt_data.get('model', 'Unknown')}: {e}")
                 self.stats['device_types']['errors'] += 1
-                dt_data['manufacturer'] = mfr_name  # Восстанавливаем
+                if mfr_name:
+                    dt_data['manufacturer'] = mfr_name  # Восстанавливаем
 
     def create_device_bay_templates(self):
         """Создание Device Bay Templates для Chassis"""
@@ -403,7 +444,7 @@ class NetBoxInitializer:
 
         for chassis_slug, bays in DEVICE_BAY_TEMPLATES.items():
             try:
-                # Получаем device type
+                # Получаем device type из кэша (включая фиктивные объекты в dry-run)
                 device_type = self.device_types_cache.get(chassis_slug)
                 if not device_type:
                     device_type = self.nb.dcim.device_types.get(slug=chassis_slug)
@@ -411,6 +452,12 @@ class NetBoxInitializer:
                 if not device_type:
                     print(f"  [ERR] Device type {chassis_slug} не найден")
                     self.stats['bay_templates']['errors'] += 1
+                    continue
+
+                # В dry-run режиме с фиктивным device_type просто показываем что будет создано
+                if self.dry_run and isinstance(device_type, FakeObject):
+                    print(f"  [DRY] {chassis_slug}: будет создано {len(bays)} bay slots")
+                    self.stats['bay_templates']['created'] += len(bays)
                     continue
 
                 # Проверяем существующие bay templates
@@ -428,9 +475,7 @@ class NetBoxInitializer:
 
                     if not self.dry_run:
                         self.nb.dcim.device_bay_templates.create(**bay_data)
-                        created_count += 1
-                    else:
-                        created_count += 1
+                    created_count += 1
 
                 if created_count > 0:
                     if not self.dry_run:
@@ -534,25 +579,45 @@ class NetBoxInitializer:
                     print(f"  [SKIP] {chassis_data['name']} - уже существует")
                     self.stats['chassis']['skipped'] += 1
                 else:
-                    # Получаем site
-                    site = self.nb.dcim.sites.get(name=chassis_data['site'])
+                    # Получаем site из кэша или NetBox
+                    site = self.sites_cache.get(chassis_data['site'])
+                    if not site:
+                        site = self.nb.dcim.sites.get(name=chassis_data['site'])
                     if not site:
                         print(f"  [ERR] {chassis_data['name']}: Site {chassis_data['site']} не найден")
                         self.stats['chassis']['errors'] += 1
                         continue
 
-                    # Получаем device role
-                    role = self.nb.dcim.device_roles.get(name=chassis_data['role'])
+                    # Получаем device role из кэша или NetBox
+                    role = self.roles_cache.get(chassis_data['role'])
+                    if not role:
+                        role = self.nb.dcim.device_roles.get(name=chassis_data['role'])
                     if not role:
                         print(f"  [ERR] {chassis_data['name']}: Role {chassis_data['role']} не найден")
                         self.stats['chassis']['errors'] += 1
                         continue
 
                     # Получаем device type по модели
-                    device_type = self.nb.dcim.device_types.get(model=chassis_data['device_type_model'])
+                    device_type = None
+                    # Сначала ищем в кэше по модели
+                    for dt in self.device_types_cache.values():
+                        if hasattr(dt, 'model') and dt.model == chassis_data['device_type_model']:
+                            device_type = dt
+                            break
+                        elif hasattr(dt, 'name') and dt.name == chassis_data['device_type_model']:
+                            device_type = dt
+                            break
+                    if not device_type:
+                        device_type = self.nb.dcim.device_types.get(model=chassis_data['device_type_model'])
                     if not device_type:
                         print(f"  [ERR] {chassis_data['name']}: Device type {chassis_data['device_type_model']} не найден")
                         self.stats['chassis']['errors'] += 1
+                        continue
+
+                    # В dry-run режиме с фиктивными объектами просто показываем что будет создано
+                    if self.dry_run and (isinstance(site, FakeObject) or isinstance(role, FakeObject) or isinstance(device_type, FakeObject)):
+                        print(f"  [DRY] {chassis_data['name']} будет создан в {chassis_data['site']}")
+                        self.stats['chassis']['created'] += 1
                         continue
 
                     create_data = {
