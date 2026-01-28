@@ -275,6 +275,30 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_status(FakeQuery(), context)
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /help"""
+    help_text = """
+ℹ️ <b>Справка по боту</b>
+
+<b>Команды:</b>
+/sync - Запустить синхронизацию
+/status - Показать статус
+/decommissioned - Список неактивных устройств
+/help - Эта справка
+
+<b>Настройки:</b>
+• Zabbix: {zabbix_url}
+• NetBox: {netbox_url}
+
+<b>Расписание:</b>
+Автоматическая синхронизация раз в день.
+    """.format(
+        zabbix_url=config.ZABBIX_URL,
+        netbox_url=config.NETBOX_URL
+    )
+    await update.message.reply_html(help_text)
+
+
 async def decommissioned_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /decommissioned - показать неактивные устройства"""
     user = update.effective_user
@@ -342,7 +366,7 @@ def main():
     application.add_handler(CommandHandler("sync", sync_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("decommissioned", decommissioned_command))
-    application.add_handler(CommandHandler("help", lambda u, c: show_help(u, c)))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button))
     
     # Запускаем бота
