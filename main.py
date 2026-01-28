@@ -191,8 +191,16 @@ def main():
         # Запускаем синхронизацию
         stats = sync.run_sync()
         
-        # Отправляем детальное уведомление
-        if config.TELEGRAM_ENABLED:
+        # Отправляем уведомление ТОЛЬКО если есть значимые изменения
+        has_changes = (
+            stats['new_hosts'] or
+            stats['changed_hosts'] or
+            stats['error_hosts'] or
+            stats['decommissioned_hosts'] or
+            stats['new_models']
+        )
+
+        if config.TELEGRAM_ENABLED and has_changes:
             message = NotificationHelper.format_sync_summary(
                 stats['new_hosts'],
                 stats['changed_hosts'],
@@ -205,6 +213,8 @@ def main():
                 format_type=config.TELEGRAM_PARSE_MODE
             )
             sync.send_telegram_notification(message)
+        elif config.TELEGRAM_ENABLED:
+            logger.info("📭 Нет значимых изменений — уведомление не отправлено")
         
         # Определяем код выхода
         if stats['error_hosts']:

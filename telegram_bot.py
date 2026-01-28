@@ -214,6 +214,7 @@ async def show_help(query, context: ContextTypes.DEFAULT_TYPE):
 /start - Главное меню
 /sync - Запустить синхронизацию
 /status - Показать статус
+/decommissioned - Список неактивных устройств
 /help - Эта справка
 
 <b>Кнопки:</b>
@@ -229,7 +230,7 @@ async def show_help(query, context: ContextTypes.DEFAULT_TYPE):
 • Лимит хостов: {limit}
 
 <b>Расписание:</b>
-Автоматический запуск каждый час через cron.
+Автоматическая синхронизация раз в день.
     """.format(
         zabbix_url=config.ZABBIX_URL,
         netbox_url=config.NETBOX_URL,
@@ -264,14 +265,72 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(user.id):
         await update.message.reply_text("❌ У вас нет доступа")
         return
-    
+
     class FakeQuery:
         async def edit_message_html(self, text):
             await update.message.reply_html(text)
         async def edit_message_text(self, text):
             await update.message.reply_text(text)
-    
+
     await show_status(FakeQuery(), context)
+
+
+async def decommissioned_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /decommissioned - показать неактивные устройства"""
+    user = update.effective_user
+    if not is_authorized(user.id):
+        await update.message.reply_text("❌ У вас нет доступа")
+        return
+
+    await update.message.reply_text("🔍 Ищу неактивные устройства...")
+
+    try:
+        import pynetbox
+
+        # Подключаемся к NetBox
+        nb = pynetbox.api(config.NETBOX_URL, token=config.NETBOX_TOKEN)
+        nb.http_session.verify = config.VERIFY_SSL
+
+        # Получаем устройства со статусом decommissioning
+        devices = list(nb.dcim.devices.filter(status='decommissioning'))
+
+        if not devices:
+            await update.message.reply_html(
+                "✅ <b>Нет неактивных устройств</b>\n\n"
+                "Все устройства в статусе Active."
+            )
+            return
+
+        # Формируем сообщение
+        lines = [
+            f"🗑 <b>Неактивные устройства ({len(devices)}):</b>\n",
+            "<i>Эти устройства удалены из Zabbix и ожидают ручного удаления из NetBox</i>\n"
+        ]
+
+        for device in devices[:20]:  # Первые 20
+            # Получаем дату decommissioning если есть
+            decom_date = device.custom_fields.get('decommissioned_date', '')
+            date_str = f" ({decom_date})" if decom_date else ""
+
+            # Ссылка на устройство в NetBox
+            device_url = f"{config.NETBOX_URL.rstrip('/')}/dcim/devices/{device.id}/"
+
+            lines.append(f"• <a href='{device_url}'>{device.name}</a>{date_str}")
+
+            # Добавляем site если есть
+            if device.site:
+                lines.append(f"  📍 {device.site.name}")
+
+        if len(devices) > 20:
+            lines.append(f"\n<i>... и ещё {len(devices) - 20} устройств</i>")
+
+        lines.append(f"\n🔗 <a href='{config.NETBOX_URL.rstrip('/')}/dcim/devices/?status=decommissioning'>Открыть в NetBox</a>")
+
+        await update.message.reply_html("\n".join(lines), disable_web_page_preview=True)
+
+    except Exception as e:
+        logger.error(f"Ошибка получения decommissioned: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
 def main():
     """Запуск бота"""
@@ -282,6 +341,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("sync", sync_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("decommissioned", decommissioned_command))
     application.add_handler(CommandHandler("help", lambda u, c: show_help(u, c)))
     application.add_handler(CallbackQueryHandler(button))
     
