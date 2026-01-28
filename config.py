@@ -44,6 +44,7 @@ TELEGRAM_DISABLE_NOTIFICATION = os.getenv('TELEGRAM_DISABLE_NOTIFICATION', 'fals
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 LOG_DIR = os.getenv('LOG_DIR', 'logs')
+LOG_RETENTION_DAYS = int(os.getenv('LOG_RETENTION_DAYS', '30'))  # Хранить логи N дней
 
 # === МАППИНГИ ===
 

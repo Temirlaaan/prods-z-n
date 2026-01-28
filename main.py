@@ -3,9 +3,10 @@
 Главный файл для запуска синхронизации Zabbix → NetBox
 """
 import sys
+import os
 import logging
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 import urllib3
 import config
 from sync import ServerSync
@@ -43,8 +44,33 @@ def setup_logging():
     logging.getLogger('urllib3').setLevel(logging.WARNING)
     logging.getLogger('pynetbox').setLevel(logging.WARNING)
     logging.getLogger('pyzabbix').setLevel(logging.WARNING)
-    
+
     return logger, log_file
+
+
+def cleanup_old_logs():
+    """Удаление логов старше LOG_RETENTION_DAYS дней"""
+    if not os.path.exists(config.LOG_DIR):
+        return 0
+
+    cutoff_date = datetime.now() - timedelta(days=config.LOG_RETENTION_DAYS)
+    deleted_count = 0
+
+    for filename in os.listdir(config.LOG_DIR):
+        if not filename.endswith('.log'):
+            continue
+
+        filepath = os.path.join(config.LOG_DIR, filename)
+        try:
+            # Получаем время модификации файла
+            file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+            if file_mtime < cutoff_date:
+                os.remove(filepath)
+                deleted_count += 1
+        except (OSError, ValueError):
+            continue
+
+    return deleted_count
 
 
 def parse_arguments():
@@ -135,10 +161,15 @@ def main():
     
     if not validate_configuration():
         sys.exit(1)
-    
+
     # Настройка логирования
     logger, log_file = setup_logging()
-    
+
+    # Очистка старых логов
+    deleted_logs = cleanup_old_logs()
+    if deleted_logs > 0:
+        logger.info(f"🗑 Удалено {deleted_logs} старых лог-файлов (старше {config.LOG_RETENTION_DAYS} дней)")
+
     logger.info("=" * 60)
     logger.info("ЗАПУСК СИНХРОНИЗАЦИИ ZABBIX → NETBOX")
     logger.info(f"Лог файл: {log_file}")
