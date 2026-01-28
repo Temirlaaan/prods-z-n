@@ -31,7 +31,7 @@ REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
 REDIS_DB = int(os.getenv('REDIS_DB', '0'))
 REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', '')
 REDIS_KEY_PREFIX = os.getenv('REDIS_KEY_PREFIX', 'zabbix_host:')
-REDIS_TTL = int(os.getenv('REDIS_TTL', '86400'))  # 24 часа
+REDIS_TTL = int(os.getenv('REDIS_TTL', '691200'))  # 8 дней (для еженедельной синхронизации)
 
 # === TELEGRAM ===
 TELEGRAM_ENABLED = os.getenv('TELEGRAM_ENABLED', 'true').lower() == 'true'
@@ -44,6 +44,7 @@ TELEGRAM_DISABLE_NOTIFICATION = os.getenv('TELEGRAM_DISABLE_NOTIFICATION', 'fals
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 LOG_DIR = os.getenv('LOG_DIR', 'logs')
+LOG_RETENTION_DAYS = int(os.getenv('LOG_RETENTION_DAYS', '30'))  # Хранить логи N дней
 
 # === МАППИНГИ ===
 
@@ -204,6 +205,14 @@ PROTECTED_FIELDS = set(filter(None, PROTECTED_FIELDS_STR.split(',')))
 # Custom fields которые НЕ перезаписываются
 PROTECTED_CUSTOM_FIELDS_STR = os.getenv('PROTECTED_CUSTOM_FIELDS', '')
 PROTECTED_CUSTOM_FIELDS = set(filter(None, PROTECTED_CUSTOM_FIELDS_STR.split(',')))
+
+# Защита rack/position от удаления (ручные изменения в NetBox сохраняются)
+PROTECT_RACK_FROM_DELETION = os.getenv('PROTECT_RACK_FROM_DELETION', 'true').lower() == 'true'
+
+# === НАСТРОЙКИ БЛОКИРОВКИ ===
+# Lock файл для предотвращения параллельного запуска
+LOCK_FILE = os.getenv('LOCK_FILE', '/tmp/zabbix-netbox-sync.lock')
+LOCK_TIMEOUT = int(os.getenv('LOCK_TIMEOUT', '3600'))  # 1 час максимум
 
 # === НАСТРОЙКИ ОЧИСТКИ ===
 # Что делать с orphaned IP адресами

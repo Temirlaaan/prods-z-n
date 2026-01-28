@@ -4,6 +4,9 @@
 """
 import logging
 import re
+import os
+import fcntl
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from pyzabbix import ZabbixAPI
@@ -19,14 +22,59 @@ from utils import (
 
 logger = logging.getLogger(__name__)
 
+class SyncLock:
+    """Менеджер блокировки для предотвращения параллельного запуска"""
+
+    def __init__(self, lock_file: str = None):
+        self.lock_file = lock_file or config.LOCK_FILE
+        self.lock_fd = None
+
+    def acquire(self) -> bool:
+        """Попытка получить блокировку"""
+        try:
+            self.lock_fd = open(self.lock_file, 'w')
+            fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Записываем PID и время начала
+            self.lock_fd.write(f"PID: {os.getpid()}\nStarted: {datetime.now().isoformat()}\n")
+            self.lock_fd.flush()
+            return True
+        except (IOError, OSError):
+            if self.lock_fd:
+                self.lock_fd.close()
+                self.lock_fd = None
+            return False
+
+    def release(self):
+        """Освобождение блокировки"""
+        if self.lock_fd:
+            try:
+                fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_UN)
+                self.lock_fd.close()
+                os.remove(self.lock_file)
+            except (IOError, OSError):
+                pass
+            finally:
+                self.lock_fd = None
+
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError("Синхронизация уже запущена (lock файл занят)")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+        return False
+
+
 class ServerSync:
     """Основной класс синхронизации"""
-    
+
     def __init__(self):
         self.zabbix = None
         self.netbox = None
         self.redis_client = None
         self.telegram_bot = None
+        self.lock = None
         self.change_tracker = ChangeTracker()  # Для отслеживания детальных изменений
         self.stats = {
             'new_hosts': [],
@@ -769,19 +817,33 @@ class ServerSync:
                             old_position = device.position
                             if old_position != new_value:
                                 changes_made.append(f"position: U{old_position} → U{new_value}")
+                        elif field == 'status':
+                            # Специальная обработка для status - сравниваем .value, не .label
+                            old_status_value = old_value.value if hasattr(old_value, 'value') else str(old_value)
+                            if old_status_value != new_value:
+                                changes_made.append(f"status: {old_status_value} → {new_value}")
                         else:
                             if hasattr(old_value, 'id'):
                                 old_value = old_value.id
                             if str(old_value) != str(new_value):
                                 changes_made.append(f"{field}: {old_value} → {new_value}")
                 
-                # ВАЖНО: Также проверяем если стойка была удалена в Zabbix
+                # ЗАЩИТА: Если в Zabbix нет данных о стойке, но в NetBox она есть - НЕ удаляем
+                # Это защищает ручные изменения в NetBox от перезаписи
                 if not rack_name and device.rack:
-                    changes_made.append(f"rack: {device.rack.name} → удалена")
-                    device_data['rack'] = None
-                    device_data['position'] = None
-                    device_data['face'] = None
-                
+                    if config.PROTECT_RACK_FROM_DELETION:
+                        logger.debug(f"  🛡 Стойка {device.rack.name} защищена от удаления (PROTECT_RACK_FROM_DELETION=true)")
+                        # Убираем rack/position/face из device_data чтобы не затереть
+                        device_data.pop('rack', None)
+                        device_data.pop('position', None)
+                        device_data.pop('face', None)
+                    else:
+                        # Старое поведение - удаление стойки
+                        changes_made.append(f"rack: {device.rack.name} → удалена")
+                        device_data['rack'] = None
+                        device_data['position'] = None
+                        device_data['face'] = None
+
                 if changes_made:
                     if not config.DRY_RUN:
                         device.update(device_data)
@@ -953,8 +1015,24 @@ class ServerSync:
 
             # Работаем с новым IP
             ip_address = self.netbox.ipam.ip_addresses.get(address=ip_with_mask)
-            
+
             if ip_address:
+                # ЗАЩИТА: Проверяем не привязан ли IP к другому устройству
+                if ip_address.assigned_object and ip_address.assigned_object_id != interface.id:
+                    # IP привязан к другому интерфейсу - проверяем чей это интерфейс
+                    try:
+                        other_interface = self.netbox.dcim.interfaces.get(ip_address.assigned_object_id)
+                        if other_interface and other_interface.device:
+                            other_device = other_interface.device
+                            if other_device.id != device.id:
+                                # IP принадлежит ДРУГОМУ устройству - не перепривязываем!
+                                logger.warning(f"    ⚠️ IP {ip} уже привязан к другому устройству: {other_device.name}")
+                                logger.warning(f"       Перепривязка отменена для защиты от конфликтов")
+                                self.stats['error_details'][f'ip_conflict_{ip}'] = f"IP принадлежит {other_device.name}"
+                                return interface, None
+                    except Exception as e:
+                        logger.debug(f"    Не удалось проверить владельца IP: {e}")
+
                 if not ip_address.assigned_object or ip_address.assigned_object_id != interface.id:
                     if not config.DRY_RUN:
                         ip_address.assigned_object_type = 'dcim.interface'
@@ -1027,12 +1105,28 @@ class ServerSync:
     
     def run_sync(self) -> dict:
         """Запуск процесса синхронизации"""
+        # Получаем lock для предотвращения параллельного запуска
+        self.lock = SyncLock()
+        if not self.lock.acquire():
+            logger.error("❌ Синхронизация уже запущена другим процессом!")
+            logger.error(f"   Lock файл: {config.LOCK_FILE}")
+            self.stats['error_details']['lock'] = "Параллельный запуск заблокирован"
+            return self.stats
+
+        try:
+            return self._run_sync_internal()
+        finally:
+            self.lock.release()
+            logger.debug("Lock освобождён")
+
+    def _run_sync_internal(self) -> dict:
+        """Внутренняя логика синхронизации"""
         logger.info("=" * 60)
         logger.info("Запуск синхронизации Zabbix → NetBox")
         if config.DRY_RUN:
             logger.info("MODE: DRY RUN (изменения не будут сохранены)")
         logger.info("=" * 60)
-        
+
         # Получаем хосты
         hosts = self.get_vmware_hosts()
         if not hosts:
