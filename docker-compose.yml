@@ -36,6 +36,33 @@ services:
     # Для периодического запуска
     command: sh -c "while true; do python main.py; sleep 3600; done"
 
+  # Telegram бот для ручного управления синхронизацией
+  # ВАЖНО: Требует отдельный TELEGRAM_BOT_TOKEN (создайте через @BotFather)
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zabbix-netbox-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      # Переопределите токен если нужен отдельный бот:
+      # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_INTERACTIVE}
+    volumes:
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+      - .:/app
+    depends_on:
+      - redis
+    networks:
+      - sync-network
+    command: python telegram_bot.py
+    # По умолчанию отключен - раскомментируйте profiles или запустите вручную
+    profiles:
+      - interactive
+
   # Опционально: Redis Commander для мониторинга
   redis-commander:
     image: rediscommander/redis-commander:latest

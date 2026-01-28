@@ -845,12 +845,18 @@ class ServerSync:
                         device_data['face'] = None
 
                 if changes_made:
+                    # Фильтруем "шумные" изменения (только last_sync)
+                    significant_changes = [c for c in changes_made if not c.startswith('last_sync:')]
+
                     if not config.DRY_RUN:
                         device.update(device_data)
                         logger.info(f"  ✓ Устройство обновлено")
                         logger.info(f"    Изменения: {', '.join(changes_made[:3])}")
-                        self.stats['changed_hosts'].append(host_name)
-                        self.stats['detailed_changes'][host_name] = changes_made
+
+                        # Добавляем в статистику только если есть значимые изменения
+                        if significant_changes:
+                            self.stats['changed_hosts'].append(host_name)
+                            self.stats['detailed_changes'][host_name] = significant_changes
                         
                         # Обновляем Redis после успешного обновления
                         if self.redis_client:
